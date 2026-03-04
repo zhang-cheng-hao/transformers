@@ -1313,6 +1313,8 @@ class LlamaModel(LlamaPreTrainedModel):
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         inbatch_attn_layers = kwargs.pop("inbatch_attn_layers", None)  # e.g. {0, 4, 8, 12, ...} or None = all
+        # Caller may pass original_attention_mask via kwargs; pop it once to avoid duplicate kwargs at decoder_layer.
+        inbatch_original_attention_mask = kwargs.pop("original_attention_mask", attention_mask)
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -1390,7 +1392,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     past_key_values,
                     _layer_inbatch_attn,
                     _layer_cached_kv,
-                    attention_mask,
+                    inbatch_original_attention_mask,
                     output_attentions,
                     use_cache,
                     cache_position,
@@ -1407,7 +1409,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     # cached_key_value=cached_key_values[layer_idx] if cached_key_values is not None else None,
                     inbatch_attn=_layer_inbatch_attn,    # ← CHANGED: gated
                     cached_key_value=_layer_cached_kv,    # ← CHANGED: gated
-                    original_attention_mask=attention_mask,
+                    original_attention_mask=inbatch_original_attention_mask,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
