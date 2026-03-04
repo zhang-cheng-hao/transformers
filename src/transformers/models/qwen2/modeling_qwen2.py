@@ -411,6 +411,9 @@ class Qwen2Attention(nn.Module):
             inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
             inbatch_attn_output = inbatch_attn_output.sum(dim=1)
 
+            if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
+                route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
+                inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
             attn_output = attn_output + inbatch_attn_output
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -762,6 +765,9 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 inbatch_attn_output = inbatch_attn_output.sum(dim=1)    
             
             # TODO: currently just add - we need to think more about other combinations - learnable parameter
+            if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
+                route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
+                inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
             attn_output = attn_output + inbatch_attn_output
 
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -1044,6 +1050,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        inbatch_attn_layers = kwargs.pop("inbatch_attn_layers", None)  # e.g. {0, 4, 8, 12, ...} or None = all
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -1106,6 +1113,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            _use_inbatch = (
+                inbatch_attn is not None
+                and cached_key_values is not None
+                and (inbatch_attn_layers is None or layer_idx in inbatch_attn_layers)
+            )
+
+            _layer_inbatch_attn = inbatch_attn if _use_inbatch else None
+            _layer_cached_kv = cached_key_values[layer_idx] if _use_inbatch else None
+
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -1113,8 +1129,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    inbatch_attn,
-                    cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    _layer_inbatch_attn,
+                    _layer_cached_kv,
                     attention_mask,
                     output_attentions,
                     use_cache,
@@ -1128,8 +1144,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
-                    inbatch_attn=inbatch_attn,
-                    cached_key_value=cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    inbatch_attn=_layer_inbatch_attn,
+                    cached_key_value=_layer_cached_kv,
                     original_attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     use_cache=use_cache,

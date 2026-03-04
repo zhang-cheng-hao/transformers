@@ -518,6 +518,9 @@ class LlamaAttention(nn.Module):
             inbatch_attn_output = inbatch_attn_output.sum(dim=1)
             
             # TODO: currently just add - we need to think more about other combinations - learnable parameter
+            if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
+                route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
+                inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
             attn_output = attn_output + inbatch_attn_output
 
 
@@ -761,6 +764,9 @@ class LlamaFlashAttention2(LlamaAttention):
                 
             # TODO: currently just add - we need to think more about other combinations - learnable parameter
             # special operation for FlashAttention
+            if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
+                route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
+                inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
             attn_output = attn_output + inbatch_attn_output.transpose(1, 2)
         
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
@@ -1027,6 +1033,9 @@ class LlamaSdpaAttention(LlamaAttention):
                         inbatch_attn_output = inbatch_attn_output.masked_fill(first_half_mask_expanded, 0.0)                
                 
             # TODO: currently just add - we need to think more about other combinations - learnable parameter
+            if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
+                route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
+                inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
             attn_output = attn_output + inbatch_attn_output
 
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -1379,13 +1388,14 @@ class LlamaModel(LlamaPreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    inbatch_attn,
-                    cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    _layer_inbatch_attn,
+                    _layer_cached_kv,
                     attention_mask,
                     output_attentions,
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    **kwargs,
                 )
             else:
                 layer_outputs = decoder_layer(
