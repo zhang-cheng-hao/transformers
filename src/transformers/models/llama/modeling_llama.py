@@ -782,6 +782,121 @@ class LlamaFlashAttention2(LlamaAttention):
 #     row_sum_ok   = (attn.sum(dim=dim) - 1.0).abs() < tol
 #     return (hot_enough & row_sum_ok).all()
 
+
+def _gather_inbatch_tensors(
+    cached_keys: torch.Tensor,
+    cached_values: torch.Tensor,
+    original_attention_mask: Optional[torch.Tensor],
+    neighbor_idx: torch.Tensor,
+):
+    batch_size, fanout = neighbor_idx.shape
+    flat_idx = neighbor_idx.reshape(-1)
+    sel_keys = torch.index_select(cached_keys, dim=0, index=flat_idx).view(batch_size, fanout, *cached_keys.shape[1:])
+    sel_values = torch.index_select(cached_values, dim=0, index=flat_idx).view(batch_size, fanout, *cached_values.shape[1:])
+    sel_pad_mask = None
+    if original_attention_mask is not None:
+        sel_pad_mask = torch.index_select(original_attention_mask, dim=0, index=flat_idx).view(batch_size, fanout, -1)
+    return sel_keys, sel_values, sel_pad_mask
+
+
+def _apply_pooled_mask(output: torch.Tensor, first_half_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    if first_half_mask is None:
+        return output
+    return output.masked_fill(first_half_mask[:, None, :, None].bool(), 0.0)
+
+
+def _compute_exact_neighbor_output(
+    query_states: torch.Tensor,
+    cached_keys: torch.Tensor,
+    cached_values: torch.Tensor,
+    original_attention_mask: Optional[torch.Tensor],
+    neighbor_idx: torch.Tensor,
+    neighbor_weight: torch.Tensor,
+    head_dim: int,
+    attention_dropout: float,
+    training: bool,
+    disable_v_norm: bool,
+) -> torch.Tensor:
+    sel_keys, sel_values, sel_pad_mask = _gather_inbatch_tensors(
+        cached_keys,
+        cached_values,
+        original_attention_mask,
+        neighbor_idx,
+    )
+
+    q = query_states.unsqueeze(1)
+    inb_scores = torch.matmul(q, sel_keys.transpose(-2, -1)) / math.sqrt(head_dim)
+
+    if sel_pad_mask is not None:
+        min_val = torch.finfo(inb_scores.dtype).min
+        add_mask = sel_pad_mask[:, :, None, None, :]
+        add_mask = add_mask.to(inb_scores.dtype).masked_fill(add_mask == 0, min_val)
+        inb_scores = inb_scores + add_mask
+
+    inb_probs = nn.functional.softmax(inb_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    inb_probs = nn.functional.dropout(inb_probs, p=attention_dropout, training=training)
+    inb_ctx = torch.matmul(inb_probs, sel_values)
+
+    if not disable_v_norm:
+        v_norm = torch.norm(sel_values, p=2, dim=-1, keepdim=True)
+        wv_norm = torch.matmul(inb_probs, v_norm)
+        inb_ctx = inb_ctx / (wv_norm + 1e-6)
+
+    comb_w = neighbor_weight.type_as(query_states)[:, :, None, None, None]
+    return (inb_ctx * comb_w).sum(dim=1)
+
+
+def _compute_tail_pooled_output(
+    query_states: torch.Tensor,
+    cached_keys: torch.Tensor,
+    cached_values: torch.Tensor,
+    original_attention_mask: Optional[torch.Tensor],
+    tail_idx: torch.Tensor,
+    tail_weight: torch.Tensor,
+    tail_mass: torch.Tensor,
+    head_dim: int,
+    attention_dropout: float,
+    training: bool,
+    disable_v_norm: bool,
+) -> torch.Tensor:
+    sel_keys, sel_values, sel_pad_mask = _gather_inbatch_tensors(
+        cached_keys,
+        cached_values,
+        original_attention_mask,
+        tail_idx,
+    )
+    mix_w = tail_weight.type_as(query_states)[:, :, None, None, None]
+
+    pooled_mask = None
+    if sel_pad_mask is not None:
+        valid = sel_pad_mask[:, :, None, :, None].to(query_states.dtype)
+        norm = (mix_w * valid).sum(dim=1).clamp_min(1e-6)
+        pooled_keys = (sel_keys * mix_w * valid).sum(dim=1) / norm
+        pooled_values = (sel_values * mix_w * valid).sum(dim=1) / norm
+        pooled_mask = sel_pad_mask.max(dim=1).values
+    else:
+        pooled_keys = (sel_keys * mix_w).sum(dim=1)
+        pooled_values = (sel_values * mix_w).sum(dim=1)
+
+    pooled_scores = torch.matmul(query_states, pooled_keys.transpose(-2, -1)) / math.sqrt(head_dim)
+
+    if pooled_mask is not None:
+        min_val = torch.finfo(pooled_scores.dtype).min
+        pooled_add_mask = pooled_mask[:, None, None, :]
+        pooled_add_mask = pooled_add_mask.to(pooled_scores.dtype).masked_fill(pooled_add_mask == 0, min_val)
+        pooled_scores = pooled_scores + pooled_add_mask
+
+    pooled_probs = nn.functional.softmax(pooled_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    pooled_probs = nn.functional.dropout(pooled_probs, p=attention_dropout, training=training)
+    pooled_ctx = torch.matmul(pooled_probs, pooled_values)
+
+    if not disable_v_norm:
+        pooled_v_norm = torch.norm(pooled_values, p=2, dim=-1, keepdim=True)
+        pooled_wv_norm = torch.matmul(pooled_probs, pooled_v_norm)
+        pooled_ctx = pooled_ctx / (pooled_wv_norm + 1e-6)
+
+    return pooled_ctx * tail_mass.type_as(query_states).view(-1, 1, 1, 1)
+
 class LlamaSdpaAttention(LlamaAttention):
     """
     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
@@ -885,7 +1000,41 @@ class LlamaSdpaAttention(LlamaAttention):
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
-            if "is_one_hot" in kwargs and kwargs["is_one_hot"]:
+            key_attention_mask = kwargs.get("cached_attention_mask", original_attention_mask)
+            if "cross_head_idx" in kwargs or "cross_tail_idx" in kwargs:
+                inbatch_attn_output = torch.zeros_like(query_states)
+
+                if "cross_head_idx" in kwargs:
+                    inbatch_attn_output = inbatch_attn_output + _compute_exact_neighbor_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        neighbor_idx=kwargs["cross_head_idx"],
+                        neighbor_weight=kwargs["cross_head_weight"],
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                    )
+
+                if "cross_tail_idx" in kwargs:
+                    inbatch_attn_output = inbatch_attn_output + _compute_tail_pooled_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        tail_idx=kwargs["cross_tail_idx"],
+                        tail_weight=kwargs["cross_tail_weight"],
+                        tail_mass=kwargs["cross_tail_mass"],
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                    )
+
+                inbatch_attn_output = _apply_pooled_mask(inbatch_attn_output, kwargs.get("first_half_mask"))
+            elif "is_one_hot" in kwargs and kwargs["is_one_hot"]:
                 attn_w = inbatch_attn.type_as(cached_keys)          # keep dtype/device
 
                 # === 1. mix the cached keys / values ========================================================
@@ -898,16 +1047,16 @@ class LlamaSdpaAttention(LlamaAttention):
                 sel_keys   = torch.einsum('bs,shld -> bhld', attn_w, cached_keys)
                 sel_values = torch.einsum('bs,shld -> bhld', attn_w, cached_values)
 
-                if original_attention_mask is not None:
+                if key_attention_mask is not None:
                     sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
-                    sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
+                    sel_pad_mask = key_attention_mask[sel_idx]      # [B, L]
 
                 inbatch_attn_weights = torch.matmul(
                     query_states,                               # [B, n_head, L_q, d]
                     sel_keys.transpose(-2, -1)                  # [B, n_head, d, L_k]
                 ) / math.sqrt(self.head_dim)
     
-                if original_attention_mask is not None:
+                if key_attention_mask is not None:
                     min_val = torch.finfo(inbatch_attn_weights.dtype).min
                     key_mask = sel_pad_mask[:, None, None, :]           # [B,1,1,L_k]
                     key_mask = key_mask.to(inbatch_attn_weights.dtype).masked_fill(key_mask == 0, min_val)
@@ -928,10 +1077,10 @@ class LlamaSdpaAttention(LlamaAttention):
                 if "sparse_attn" in kwargs and kwargs["sparse_attn"]:
                     # -------- Sparse top-k per row (memory-efficient) --------
                     top_k = int(kwargs.get("top_k", 4))
-                    B = inbatch_attn.size(0)
-                    top_k = min(top_k, B)
+                    q_batch, key_batch = inbatch_attn.shape
+                    top_k = min(top_k, key_batch)
 
-                    vals, idx = torch.topk(inbatch_attn, k=top_k, dim=1, largest=True, sorted=False)  # [B,K]
+                    vals, idx = torch.topk(inbatch_attn, k=top_k, dim=1, largest=True, sorted=False)  # [Q,K]
                     vals = vals.type_as(query_states)
 
                     # Optional: L1-normalize across the K picked sources
@@ -939,37 +1088,37 @@ class LlamaSdpaAttention(LlamaAttention):
 
                     flat_idx = idx.reshape(-1)  # [B*K]
                     sel_keys = torch.index_select(cached_keys, dim=0, index=flat_idx) \
-                                    .view(B, top_k, *cached_keys.shape[1:])            # [B,K,H,Lk,d]
+                                    .view(q_batch, top_k, *cached_keys.shape[1:])            # [Q,K,H,Lk,d]
                     sel_values = torch.index_select(cached_values, dim=0, index=flat_idx) \
-                                    .view(B, top_k, *cached_values.shape[1:])        # [B,K,H,Lk,d]
+                                    .view(q_batch, top_k, *cached_values.shape[1:])        # [Q,K,H,Lk,d]
 
-                    q = query_states.unsqueeze(1)                                       # [B,1,H,Lq,d]
-                    k_t = sel_keys.transpose(-2, -1)                                    # [B,K,H,d,Lk]
-                    inb_scores = torch.matmul(q, k_t) / math.sqrt(self.head_dim)        # [B,K,H,Lq,Lk]
+                    q = query_states.unsqueeze(1)                                       # [Q,1,H,Lq,d]
+                    k_t = sel_keys.transpose(-2, -1)                                    # [Q,K,H,d,Lk]
+                    inb_scores = torch.matmul(q, k_t) / math.sqrt(self.head_dim)        # [Q,K,H,Lq,Lk]
 
-                    if original_attention_mask is not None:
-                        sel_pad_mask = torch.index_select(original_attention_mask, dim=0, index=flat_idx) \
-                                                .view(B, top_k, -1)                     # [B,K,Lk]
+                    if key_attention_mask is not None:
+                        sel_pad_mask = torch.index_select(key_attention_mask, dim=0, index=flat_idx) \
+                                                .view(q_batch, top_k, -1)                     # [Q,K,Lk]
                         min_val = torch.finfo(inb_scores.dtype).min
-                        add_mask = sel_pad_mask[:, :, None, None, :]                    # [B,K,1,1,Lk]
+                        add_mask = sel_pad_mask[:, :, None, None, :]                    # [Q,K,1,1,Lk]
                         add_mask = add_mask.to(inb_scores.dtype).masked_fill(add_mask == 0, min_val)
                         inb_scores = inb_scores + add_mask
 
                     inb_probs = nn.functional.softmax(inb_scores, dim=-1, dtype=torch.float32).to(q.dtype)
                     inb_probs = nn.functional.dropout(inb_probs, p=self.attention_dropout, training=self.training)
 
-                    inb_ctx = torch.matmul(inb_probs, sel_values)                        # [B,K,H,Lq,d]
+                    inb_ctx = torch.matmul(inb_probs, sel_values)                        # [Q,K,H,Lq,d]
 
                     if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
-                        v_norm = torch.norm(sel_values, p=2, dim=-1, keepdim=True)       # [B,K,H,Lk,1]
-                        wv_norm = torch.matmul(inb_probs, v_norm)                         # [B,K,H,Lq,1]
+                        v_norm = torch.norm(sel_values, p=2, dim=-1, keepdim=True)       # [Q,K,H,Lk,1]
+                        wv_norm = torch.matmul(inb_probs, v_norm)                         # [Q,K,H,Lq,1]
                         inb_ctx = inb_ctx / (wv_norm + 1e-6)
 
-                    comb_w = vals[:, :, None, None, None]                                # [B,K,1,1,1]
-                    inbatch_attn_output = (inb_ctx * comb_w).sum(dim=1)                  # [B,H,Lq,d]
+                    comb_w = vals[:, :, None, None, None]                                # [Q,K,1,1,1]
+                    inbatch_attn_output = (inb_ctx * comb_w).sum(dim=1)                  # [Q,H,Lq,d]
 
                     if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
-                        first_half_mask = kwargs["first_half_mask"]                      # [B,Lq]
+                        first_half_mask = kwargs["first_half_mask"]                      # [Q,Lq]
                         inbatch_attn_output = inbatch_attn_output.masked_fill(
                             first_half_mask[:, None, :, None].bool(), 0.0
                         )
@@ -981,17 +1130,17 @@ class LlamaSdpaAttention(LlamaAttention):
                     # B (query) x B (key) x num_heads x seq_len x seq_len
                     inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-                    if original_attention_mask is not None:
+                    if key_attention_mask is not None:
                         # origianl_attention_mask is for key, instead of query
                         # as for query, it is already covered by the causal mask
                         min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
                         # original_attention_mask = original_attention_mask[None, :, None, None, :]
-                        padding_mask = original_attention_mask == 0
-                        original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                        padding_mask = key_attention_mask == 0
+                        key_attention_mask = key_attention_mask.to(query_states.dtype).masked_fill(
                             padding_mask, min_dtype
                         )                
                         # add original casual mask
-                        inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                        inbatch_attn_weights = inbatch_attn_weights + key_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
                     # B (query) x B (key) x num_heads x seq_len x seq_len
                     inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
