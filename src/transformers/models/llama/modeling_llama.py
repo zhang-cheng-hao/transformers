@@ -463,6 +463,7 @@ class LlamaAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)        
         
         if inbatch_attn is not None and cached_key_value is not None:
+            cross_attention_mask = kwargs.get("cross_attention_mask", original_attention_mask)
             # Debugging: Log shapes to diagnose rank disagreement
             # if self.layer_idx == 0:
             #     if torch.distributed.is_initialized():
@@ -491,17 +492,16 @@ class LlamaAttention(nn.Module):
             # B (query) x B (key) x num_heads x seq_len x head_dim
             inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-            if original_attention_mask is not None:
+            if cross_attention_mask is not None:
                 # origianl_attention_mask is for key, instead of query
                 # as for query, it is already covered by the causal mask
                 min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                # original_attention_mask = original_attention_mask[None, :, None, None, :]
-                padding_mask = original_attention_mask == 0
-                original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                padding_mask = cross_attention_mask == 0
+                cross_attention_mask = cross_attention_mask.to(query_states.dtype).masked_fill(
                     padding_mask, min_dtype
                 )                
                 # add original casual mask
-                inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                inbatch_attn_weights = inbatch_attn_weights + cross_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
             # B (query) x B (key) x num_heads x seq_len x head_dim
             inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -660,6 +660,7 @@ class LlamaFlashAttention2(LlamaAttention):
         )
 
         if inbatch_attn is not None and cached_key_value is not None:
+            cross_attention_mask = kwargs.get("cross_attention_mask", original_attention_mask)
             # transpose back
             query_states = query_states.transpose(1, 2)
             
@@ -680,16 +681,16 @@ class LlamaFlashAttention2(LlamaAttention):
                 sel_keys   = torch.einsum('bs,shld -> bhld', attn_w, cached_keys)
                 sel_values = torch.einsum('bs,shld -> bhld', attn_w, cached_values)
 
-                if original_attention_mask is not None:
+                if cross_attention_mask is not None:
                     sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
-                    sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
+                    sel_pad_mask = cross_attention_mask[sel_idx]      # [B, L]
 
                 inbatch_attn_weights = torch.matmul(
                     query_states,                               # [B, n_head, L_q, d]
                     sel_keys.transpose(-2, -1)                  # [B, n_head, d, L_k]
                 ) / math.sqrt(self.head_dim)
     
-                if original_attention_mask is not None:
+                if cross_attention_mask is not None:
                     min_val = torch.finfo(inbatch_attn_weights.dtype).min
                     key_mask = sel_pad_mask[:, None, None, :]           # [B,1,1,L_k]
                     key_mask = key_mask.to(inbatch_attn_weights.dtype).masked_fill(key_mask == 0, min_val)
@@ -714,17 +715,16 @@ class LlamaFlashAttention2(LlamaAttention):
                 # B (query) x B (key) x num_heads x seq_len x seq_len
                 inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-                if original_attention_mask is not None:
+                if cross_attention_mask is not None:
                     # origianl_attention_mask is for key, instead of query
                     # as for query, it is already covered by the causal mask
                     min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                    # original_attention_mask = original_attention_mask[None, :, None, None, :]
-                    padding_mask = original_attention_mask == 0
-                    original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                    padding_mask = cross_attention_mask == 0
+                    cross_attention_mask = cross_attention_mask.to(query_states.dtype).masked_fill(
                         padding_mask, min_dtype
                     )                
                     # add original casual mask
-                    inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                    inbatch_attn_weights = inbatch_attn_weights + cross_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
                 # B (query) x B (key) x num_heads x seq_len x seq_len
                 inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -881,6 +881,7 @@ class LlamaSdpaAttention(LlamaAttention):
         )
 
         if inbatch_attn is not None and cached_key_value is not None:            
+            cross_attention_mask = kwargs.get("cross_attention_mask", original_attention_mask)
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
@@ -898,16 +899,16 @@ class LlamaSdpaAttention(LlamaAttention):
                 sel_keys   = torch.einsum('bs,shld -> bhld', attn_w, cached_keys)
                 sel_values = torch.einsum('bs,shld -> bhld', attn_w, cached_values)
 
-                if original_attention_mask is not None:
+                if cross_attention_mask is not None:
                     sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
-                    sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
+                    sel_pad_mask = cross_attention_mask[sel_idx]      # [B, L]
 
                 inbatch_attn_weights = torch.matmul(
                     query_states,                               # [B, n_head, L_q, d]
                     sel_keys.transpose(-2, -1)                  # [B, n_head, d, L_k]
                 ) / math.sqrt(self.head_dim)
     
-                if original_attention_mask is not None:
+                if cross_attention_mask is not None:
                     min_val = torch.finfo(inbatch_attn_weights.dtype).min
                     key_mask = sel_pad_mask[:, None, None, :]           # [B,1,1,L_k]
                     key_mask = key_mask.to(inbatch_attn_weights.dtype).masked_fill(key_mask == 0, min_val)
@@ -947,8 +948,8 @@ class LlamaSdpaAttention(LlamaAttention):
                     k_t = sel_keys.transpose(-2, -1)                                    # [B,K,H,d,Lk]
                     inb_scores = torch.matmul(q, k_t) / math.sqrt(self.head_dim)        # [B,K,H,Lq,Lk]
 
-                    if original_attention_mask is not None:
-                        sel_pad_mask = torch.index_select(original_attention_mask, dim=0, index=flat_idx) \
+                    if cross_attention_mask is not None:
+                        sel_pad_mask = torch.index_select(cross_attention_mask, dim=0, index=flat_idx) \
                                                 .view(B, top_k, -1)                     # [B,K,Lk]
                         min_val = torch.finfo(inb_scores.dtype).min
                         add_mask = sel_pad_mask[:, :, None, None, :]                    # [B,K,1,1,Lk]
@@ -981,17 +982,16 @@ class LlamaSdpaAttention(LlamaAttention):
                     # B (query) x B (key) x num_heads x seq_len x seq_len
                     inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-                    if original_attention_mask is not None:
+                    if cross_attention_mask is not None:
                         # origianl_attention_mask is for key, instead of query
                         # as for query, it is already covered by the causal mask
                         min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                        # original_attention_mask = original_attention_mask[None, :, None, None, :]
-                        padding_mask = original_attention_mask == 0
-                        original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                        padding_mask = cross_attention_mask == 0
+                        cross_attention_mask = cross_attention_mask.to(query_states.dtype).masked_fill(
                             padding_mask, min_dtype
                         )                
                         # add original casual mask
-                        inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                        inbatch_attn_weights = inbatch_attn_weights + cross_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
                     # B (query) x B (key) x num_heads x seq_len x seq_len
                     inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)

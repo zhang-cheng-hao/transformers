@@ -384,6 +384,7 @@ class Qwen2Attention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)
 
         if inbatch_attn is not None and cached_key_value is not None:
+            cross_attention_mask = kwargs.get("cross_attention_mask", original_attention_mask)
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
@@ -392,14 +393,14 @@ class Qwen2Attention(nn.Module):
             cached_key_expanded = cached_keys.unsqueeze(0)
             query_states_expanded = query_states.unsqueeze(1)
             inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if original_attention_mask is not None:
+            if cross_attention_mask is not None:
                 min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                padding_mask = original_attention_mask == 0
-                original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                padding_mask = cross_attention_mask == 0
+                cross_attention_mask = cross_attention_mask.to(query_states.dtype).masked_fill(
                     padding_mask, min_dtype
                 )                
                 # add original casual mask
-                inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                inbatch_attn_weights = inbatch_attn_weights + cross_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
             # B (query) x B (key) x num_heads x seq_len x head_dim
             inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
@@ -682,6 +683,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
         )
 
         if inbatch_attn is not None and cached_key_value is not None:            
+            cross_attention_mask = kwargs.get("cross_attention_mask", original_attention_mask)
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
@@ -692,15 +694,15 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 sel_keys = cached_keys[sel_idx] # [B, n_head, L, d]
                 sel_values = cached_values[sel_idx] # [B, n_head, L, d]
 
-                if original_attention_mask is not None:
-                    sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
+                if cross_attention_mask is not None:
+                    sel_pad_mask = cross_attention_mask[sel_idx]      # [B, L]
 
                 inbatch_attn_weights = torch.matmul(
                     query_states,                               # [B, n_head, L_q, d]
                     sel_keys.transpose(-2, -1)                  # [B, n_head, d, L_k]
                 ) / math.sqrt(self.head_dim)
     
-                if original_attention_mask is not None:
+                if cross_attention_mask is not None:
                     min_val = torch.finfo(inbatch_attn_weights.dtype).min
                     key_mask = sel_pad_mask[:, None, None, :]           # [B,1,1,L_k]
                     key_mask = key_mask.to(inbatch_attn_weights.dtype).masked_fill(key_mask == 0, min_val)
@@ -725,17 +727,16 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 # B (query) x B (key) x num_heads x seq_len x seq_len
                 inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-                if original_attention_mask is not None:
+                if cross_attention_mask is not None:
                     # origianl_attention_mask is for key, instead of query
                     # as for query, it is already covered by the causal mask
                     min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                    # original_attention_mask = original_attention_mask[None, :, None, None, :]
-                    padding_mask = original_attention_mask == 0
-                    original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                    padding_mask = cross_attention_mask == 0
+                    cross_attention_mask = cross_attention_mask.to(query_states.dtype).masked_fill(
                         padding_mask, min_dtype
                     )                
                     # add original casual mask
-                    inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                    inbatch_attn_weights = inbatch_attn_weights + cross_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
                 # B (query) x B (key) x num_heads x seq_len x seq_len
                 inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
