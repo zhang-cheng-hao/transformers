@@ -483,42 +483,93 @@ class LlamaAttention(nn.Module):
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+            key_attention_mask = kwargs.get("cached_attention_mask", original_attention_mask)
 
-            # 1 x B x num_heads x seq_len x head_dim
-            cached_key_expanded = cached_keys.unsqueeze(0)
-            # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
-            query_states_expanded = query_states.unsqueeze(1)
-            # B (query) x B (key) x num_heads x seq_len x head_dim
-            inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if "cross_head_idx" in kwargs or "cross_tail_group_idx" in kwargs or "cross_tail_idx" in kwargs:
+                inbatch_attn_output = torch.zeros_like(query_states)
 
-            if original_attention_mask is not None:
-                # origianl_attention_mask is for key, instead of query
-                # as for query, it is already covered by the causal mask
-                min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                # original_attention_mask = original_attention_mask[None, :, None, None, :]
-                padding_mask = original_attention_mask == 0
-                original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
-                    padding_mask, min_dtype
-                )                
-                # add original casual mask
-                inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                if "cross_head_idx" in kwargs:
+                    token_prune_cfg = kwargs.get("cross_doc_state", {}).get("token_prune_cfg")
+                    inbatch_attn_output = inbatch_attn_output + _compute_exact_neighbor_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        neighbor_idx=kwargs["cross_head_idx"],
+                        neighbor_weight=kwargs["cross_head_weight"],
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                        token_prune_cfg=token_prune_cfg,
+                    )
 
-            # B (query) x B (key) x num_heads x seq_len x head_dim
-            inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
-            
-            # 1 x B x num_heads x seq_len x head_dim
-            catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
-            # B x B x num_heads x seq_len x head_dim
-            inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+                if "cross_tail_group_idx" in kwargs:
+                    tail_pool_cfg = kwargs.get("cross_doc_state", {}).get("tail_pool_cfg", {})
+                    inbatch_attn_output = inbatch_attn_output + _compute_grouped_tail_pooled_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        tail_group_idx=kwargs["cross_tail_group_idx"],
+                        tail_group_weight=kwargs["cross_tail_group_weight"],
+                        tail_group_mass=kwargs["cross_tail_group_mass"],
+                        tail_group_valid_mask=kwargs.get("cross_tail_group_valid_mask"),
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                        slot_mode=tail_pool_cfg.get("slot_mode", "identity"),
+                        slot_count=tail_pool_cfg.get("slot_count", 0),
+                    )
+                elif "cross_tail_idx" in kwargs:
+                    inbatch_attn_output = inbatch_attn_output + _compute_tail_pooled_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        tail_idx=kwargs["cross_tail_idx"],
+                        tail_weight=kwargs["cross_tail_weight"],
+                        tail_mass=kwargs["cross_tail_mass"],
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                    )
 
-            # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
-            # inbatch_attn_output : B x B x num_heads x seq_len x head_dim
-            inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
-            inbatch_attn_output = inbatch_attn_output.sum(dim=1)
-            
-            # TODO: currently just add - we need to think more about other combinations - learnable parameter
-            attn_output = attn_output + inbatch_attn_output
+                inbatch_attn_output = _apply_pooled_mask(inbatch_attn_output, kwargs.get("first_half_mask"))
+                attn_output = attn_output + inbatch_attn_output
+            else:
+                # 1 x B x num_heads x seq_len x head_dim
+                cached_key_expanded = cached_keys.unsqueeze(0)
+                # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
+                query_states_expanded = query_states.unsqueeze(1)
+                # B (query) x B (key) x num_heads x seq_len x head_dim
+                inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+                if key_attention_mask is not None:
+                    min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                    padding_mask = key_attention_mask == 0
+                    key_attention_mask = key_attention_mask.to(query_states.dtype).masked_fill(
+                        padding_mask, min_dtype
+                    )                
+                    inbatch_attn_weights = inbatch_attn_weights + key_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+
+                inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+                
+                catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
+                inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+
+                if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
+                    value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)
+                    weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
+                    epsilon = 1e-6
+                    inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
+
+                inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
+                inbatch_attn_output = inbatch_attn_output.sum(dim=1)
+                attn_output = attn_output + inbatch_attn_output
 
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -667,7 +718,61 @@ class LlamaFlashAttention2(LlamaAttention):
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
-            if "is_one_hot" in kwargs and kwargs["is_one_hot"]:
+            key_attention_mask = kwargs.get("cached_attention_mask", original_attention_mask)
+            if "cross_head_idx" in kwargs or "cross_tail_group_idx" in kwargs or "cross_tail_idx" in kwargs:
+                inbatch_attn_output = torch.zeros_like(query_states)
+
+                if "cross_head_idx" in kwargs:
+                    token_prune_cfg = kwargs.get("cross_doc_state", {}).get("token_prune_cfg")
+                    inbatch_attn_output = inbatch_attn_output + _compute_exact_neighbor_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        neighbor_idx=kwargs["cross_head_idx"],
+                        neighbor_weight=kwargs["cross_head_weight"],
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                        token_prune_cfg=token_prune_cfg,
+                    )
+
+                if "cross_tail_group_idx" in kwargs:
+                    tail_pool_cfg = kwargs.get("cross_doc_state", {}).get("tail_pool_cfg", {})
+                    inbatch_attn_output = inbatch_attn_output + _compute_grouped_tail_pooled_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        tail_group_idx=kwargs["cross_tail_group_idx"],
+                        tail_group_weight=kwargs["cross_tail_group_weight"],
+                        tail_group_mass=kwargs["cross_tail_group_mass"],
+                        tail_group_valid_mask=kwargs.get("cross_tail_group_valid_mask"),
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                        slot_mode=tail_pool_cfg.get("slot_mode", "identity"),
+                        slot_count=tail_pool_cfg.get("slot_count", 0),
+                    )
+                elif "cross_tail_idx" in kwargs:
+                    inbatch_attn_output = inbatch_attn_output + _compute_tail_pooled_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        tail_idx=kwargs["cross_tail_idx"],
+                        tail_weight=kwargs["cross_tail_weight"],
+                        tail_mass=kwargs["cross_tail_mass"],
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                    )
+
+                inbatch_attn_output = _apply_pooled_mask(inbatch_attn_output, kwargs.get("first_half_mask"))
+            elif "is_one_hot" in kwargs and kwargs["is_one_hot"]:
                 attn_w = inbatch_attn.type_as(cached_keys)          # keep dtype/device
 
                 # === 1. mix the cached keys / values ========================================================
@@ -799,10 +904,115 @@ def _gather_inbatch_tensors(
     return sel_keys, sel_values, sel_pad_mask
 
 
+def _gather_grouped_inbatch_tensors(
+    cached_keys: torch.Tensor,
+    cached_values: torch.Tensor,
+    original_attention_mask: Optional[torch.Tensor],
+    neighbor_idx: torch.Tensor,
+):
+    batch_size, group_count, docs_per_group = neighbor_idx.shape
+    flat_idx = neighbor_idx.reshape(-1)
+    sel_keys = torch.index_select(cached_keys, dim=0, index=flat_idx).view(
+        batch_size, group_count, docs_per_group, *cached_keys.shape[1:]
+    )
+    sel_values = torch.index_select(cached_values, dim=0, index=flat_idx).view(
+        batch_size, group_count, docs_per_group, *cached_values.shape[1:]
+    )
+    sel_pad_mask = None
+    if original_attention_mask is not None:
+        sel_pad_mask = torch.index_select(original_attention_mask, dim=0, index=flat_idx).view(
+            batch_size, group_count, docs_per_group, -1
+        )
+    return sel_keys, sel_values, sel_pad_mask
+
+
 def _apply_pooled_mask(output: torch.Tensor, first_half_mask: Optional[torch.Tensor]) -> torch.Tensor:
     if first_half_mask is None:
         return output
     return output.masked_fill(first_half_mask[:, None, :, None].bool(), 0.0)
+
+
+def _pool_group_slots(
+    grouped_tensor: torch.Tensor,
+    grouped_mask: Optional[torch.Tensor],
+    slot_mode: str,
+    slot_count: int,
+):
+    if slot_mode == "identity" or slot_count <= 0:
+        return grouped_tensor, grouped_mask
+
+    if slot_mode != "segment_mean":
+        raise ValueError(f"Unsupported cross_tail_slot_mode: {slot_mode}")
+
+    _, _, _, seq_len, _ = grouped_tensor.shape
+    slot_count = min(max(int(slot_count), 1), seq_len)
+    pooled_chunks = []
+    pooled_masks = [] if grouped_mask is not None else None
+
+    for slot_idx in range(slot_count):
+        start = (slot_idx * seq_len) // slot_count
+        end = ((slot_idx + 1) * seq_len) // slot_count
+        end = max(end, start + 1)
+        chunk = grouped_tensor[:, :, :, start:end, :]
+        if grouped_mask is None:
+            pooled_chunks.append(chunk.mean(dim=3))
+            continue
+
+        chunk_mask = grouped_mask[:, :, start:end]
+        chunk_valid = chunk_mask[:, :, None, :, None].to(grouped_tensor.dtype)
+        denom = chunk_valid.sum(dim=3).clamp_min(1e-6)
+        pooled_chunks.append((chunk * chunk_valid).sum(dim=3) / denom)
+        pooled_masks.append(chunk_mask.any(dim=-1))
+
+    pooled_tensor = torch.stack(pooled_chunks, dim=3)
+    pooled_mask = torch.stack(pooled_masks, dim=-1) if pooled_masks is not None else None
+    return pooled_tensor, pooled_mask
+
+
+def _compute_exact_token_keep_idx(
+    sel_keys: torch.Tensor,
+    sel_values: torch.Tensor,
+    sel_pad_mask: Optional[torch.Tensor],
+    token_prune_cfg: Optional[dict],
+) -> Optional[torch.Tensor]:
+    if not token_prune_cfg or not token_prune_cfg.get("enabled", False):
+        return None
+
+    if token_prune_cfg.get("granularity", "shared_per_doc") != "shared_per_doc":
+        raise ValueError("V1 token pruning only supports shared_per_doc granularity.")
+
+    batch_size, fanout, _, seq_len, _ = sel_keys.shape
+    topk = int(token_prune_cfg.get("topk", 0))
+    if topk <= 0 or topk >= seq_len:
+        return None
+
+    metric = token_prune_cfg.get("metric", "kv_norm")
+    key_norm = torch.norm(sel_keys, p=2, dim=-1).mean(dim=2)
+    value_norm = torch.norm(sel_values, p=2, dim=-1).mean(dim=2)
+
+    if metric == "kv_norm":
+        token_score = key_norm + value_norm
+    elif metric == "sim_x_kv_norm":
+        similarity = (sel_keys * sel_values).sum(dim=-1).mean(dim=2).abs()
+        token_score = similarity * (key_norm + value_norm)
+    elif metric == "random":
+        token_score = torch.rand(batch_size, fanout, seq_len, device=sel_keys.device, dtype=sel_keys.dtype)
+    else:
+        raise ValueError(f"Unsupported token prune metric: {metric}")
+
+    if sel_pad_mask is not None:
+        token_score = token_score.masked_fill(sel_pad_mask == 0, float("-inf"))
+
+    keep_k = min(topk, seq_len)
+    return torch.topk(token_score, k=keep_k, dim=-1, largest=True, sorted=False).indices
+
+
+def _gather_token_subset(
+    sel_tensor: torch.Tensor,
+    token_idx: torch.Tensor,
+) -> torch.Tensor:
+    gather_idx = token_idx[:, :, None, :, None].expand(-1, -1, sel_tensor.size(2), -1, sel_tensor.size(-1))
+    return torch.gather(sel_tensor, dim=3, index=gather_idx)
 
 
 def _compute_exact_neighbor_output(
@@ -816,6 +1026,7 @@ def _compute_exact_neighbor_output(
     attention_dropout: float,
     training: bool,
     disable_v_norm: bool,
+    token_prune_cfg: Optional[dict] = None,
 ) -> torch.Tensor:
     sel_keys, sel_values, sel_pad_mask = _gather_inbatch_tensors(
         cached_keys,
@@ -823,6 +1034,12 @@ def _compute_exact_neighbor_output(
         original_attention_mask,
         neighbor_idx,
     )
+    token_keep_idx = _compute_exact_token_keep_idx(sel_keys, sel_values, sel_pad_mask, token_prune_cfg)
+    if token_keep_idx is not None:
+        sel_keys = _gather_token_subset(sel_keys, token_keep_idx)
+        sel_values = _gather_token_subset(sel_values, token_keep_idx)
+        if sel_pad_mask is not None:
+            sel_pad_mask = torch.gather(sel_pad_mask, dim=2, index=token_keep_idx)
 
     q = query_states.unsqueeze(1)
     inb_scores = torch.matmul(q, sel_keys.transpose(-2, -1)) / math.sqrt(head_dim)
@@ -896,6 +1113,71 @@ def _compute_tail_pooled_output(
         pooled_ctx = pooled_ctx / (pooled_wv_norm + 1e-6)
 
     return pooled_ctx * tail_mass.type_as(query_states).view(-1, 1, 1, 1)
+
+
+def _compute_grouped_tail_pooled_output(
+    query_states: torch.Tensor,
+    cached_keys: torch.Tensor,
+    cached_values: torch.Tensor,
+    original_attention_mask: Optional[torch.Tensor],
+    tail_group_idx: torch.Tensor,
+    tail_group_weight: torch.Tensor,
+    tail_group_mass: torch.Tensor,
+    tail_group_valid_mask: Optional[torch.Tensor],
+    head_dim: int,
+    attention_dropout: float,
+    training: bool,
+    disable_v_norm: bool,
+    slot_mode: str,
+    slot_count: int,
+) -> torch.Tensor:
+    sel_keys, sel_values, sel_pad_mask = _gather_grouped_inbatch_tensors(
+        cached_keys,
+        cached_values,
+        original_attention_mask,
+        tail_group_idx,
+    )
+    mix_w = tail_group_weight.type_as(query_states)[:, :, :, None, None, None]
+
+    grouped_mask = None
+    if sel_pad_mask is not None:
+        valid = sel_pad_mask[:, :, :, None, :, None].to(query_states.dtype)
+        norm = (mix_w * valid).sum(dim=2).clamp_min(1e-6)
+        grouped_keys = (sel_keys * mix_w * valid).sum(dim=2) / norm
+        grouped_values = (sel_values * mix_w * valid).sum(dim=2) / norm
+        grouped_mask = sel_pad_mask.any(dim=2)
+    else:
+        grouped_keys = (sel_keys * mix_w).sum(dim=2)
+        grouped_values = (sel_values * mix_w).sum(dim=2)
+
+    pooled_group_mask = grouped_mask
+    grouped_keys, pooled_group_mask = _pool_group_slots(grouped_keys, grouped_mask, slot_mode, slot_count)
+    grouped_values, _ = _pool_group_slots(grouped_values, grouped_mask, slot_mode, slot_count)
+
+    q = query_states.unsqueeze(1)
+    grouped_scores = torch.matmul(q, grouped_keys.transpose(-2, -1)) / math.sqrt(head_dim)
+
+    if pooled_group_mask is not None:
+        min_val = torch.finfo(grouped_scores.dtype).min
+        add_mask = pooled_group_mask[:, :, None, None, :]
+        add_mask = add_mask.to(grouped_scores.dtype).masked_fill(add_mask == 0, min_val)
+        grouped_scores = grouped_scores + add_mask
+
+    grouped_probs = nn.functional.softmax(grouped_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    grouped_probs = nn.functional.dropout(grouped_probs, p=attention_dropout, training=training)
+    grouped_ctx = torch.matmul(grouped_probs, grouped_values)
+
+    if not disable_v_norm:
+        grouped_v_norm = torch.norm(grouped_values, p=2, dim=-1, keepdim=True)
+        grouped_wv_norm = torch.matmul(grouped_probs, grouped_v_norm)
+        grouped_ctx = grouped_ctx / (grouped_wv_norm + 1e-6)
+
+    if tail_group_valid_mask is not None:
+        active_group_mask = tail_group_valid_mask.any(dim=-1).type_as(query_states)
+        tail_group_mass = tail_group_mass * active_group_mask
+
+    group_mass = tail_group_mass.type_as(query_states)[:, :, None, None, None]
+    return (grouped_ctx * group_mass).sum(dim=1)
 
 class LlamaSdpaAttention(LlamaAttention):
     """
@@ -1001,10 +1283,11 @@ class LlamaSdpaAttention(LlamaAttention):
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
             key_attention_mask = kwargs.get("cached_attention_mask", original_attention_mask)
-            if "cross_head_idx" in kwargs or "cross_tail_idx" in kwargs:
+            if "cross_head_idx" in kwargs or "cross_tail_group_idx" in kwargs or "cross_tail_idx" in kwargs:
                 inbatch_attn_output = torch.zeros_like(query_states)
 
                 if "cross_head_idx" in kwargs:
+                    token_prune_cfg = kwargs.get("cross_doc_state", {}).get("token_prune_cfg")
                     inbatch_attn_output = inbatch_attn_output + _compute_exact_neighbor_output(
                         query_states=query_states,
                         cached_keys=cached_keys,
@@ -1016,9 +1299,28 @@ class LlamaSdpaAttention(LlamaAttention):
                         attention_dropout=self.attention_dropout,
                         training=self.training,
                         disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                        token_prune_cfg=token_prune_cfg,
                     )
 
-                if "cross_tail_idx" in kwargs:
+                if "cross_tail_group_idx" in kwargs:
+                    tail_pool_cfg = kwargs.get("cross_doc_state", {}).get("tail_pool_cfg", {})
+                    inbatch_attn_output = inbatch_attn_output + _compute_grouped_tail_pooled_output(
+                        query_states=query_states,
+                        cached_keys=cached_keys,
+                        cached_values=cached_values,
+                        original_attention_mask=key_attention_mask,
+                        tail_group_idx=kwargs["cross_tail_group_idx"],
+                        tail_group_weight=kwargs["cross_tail_group_weight"],
+                        tail_group_mass=kwargs["cross_tail_group_mass"],
+                        tail_group_valid_mask=kwargs.get("cross_tail_group_valid_mask"),
+                        head_dim=self.head_dim,
+                        attention_dropout=self.attention_dropout,
+                        training=self.training,
+                        disable_v_norm="disable_v_norm" in kwargs and kwargs["disable_v_norm"],
+                        slot_mode=tail_pool_cfg.get("slot_mode", "identity"),
+                        slot_count=tail_pool_cfg.get("slot_count", 0),
+                    )
+                elif "cross_tail_idx" in kwargs:
                     inbatch_attn_output = inbatch_attn_output + _compute_tail_pooled_output(
                         query_states=query_states,
                         cached_keys=cached_keys,
@@ -1452,7 +1754,20 @@ class LlamaModel(LlamaPreTrainedModel):
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        cross_doc_state = kwargs.get("cross_doc_state")
         inbatch_attn_layers = kwargs.pop("inbatch_attn_layers", None)  # e.g. {0, 4, 8, 12, ...} or None = all
+        if cross_doc_state is not None:
+            if inbatch_attn_layers is None:
+                inbatch_attn_layers = cross_doc_state.get("layer_mask")
+            if "disable_v_norm" not in kwargs and "disable_v_norm" in cross_doc_state:
+                kwargs["disable_v_norm"] = cross_doc_state["disable_v_norm"]
+            if "cross_head_idx" not in kwargs and cross_doc_state.get("head_doc_idx") is not None:
+                kwargs["cross_head_idx"] = cross_doc_state["head_doc_idx"]
+                kwargs["cross_head_weight"] = cross_doc_state["head_doc_weight"]
+            if "cross_tail_idx" not in kwargs and cross_doc_state.get("tail_doc_idx") is not None:
+                kwargs["cross_tail_idx"] = cross_doc_state["tail_doc_idx"]
+                kwargs["cross_tail_weight"] = cross_doc_state["tail_doc_weight"]
+                kwargs["cross_tail_mass"] = cross_doc_state["tail_doc_mass"]
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -1522,19 +1837,36 @@ class LlamaModel(LlamaPreTrainedModel):
             _layer_cached_kv = cached_key_values[layer_idx] if _use_inbatch else None
 
             if self.gradient_checkpointing and self.training:
+                layer_kwargs = dict(kwargs)
+                layer_kwargs.update(
+                    {
+                        "original_attention_mask": attention_mask,
+                        "output_attentions": output_attentions,
+                        "use_cache": use_cache,
+                        "cache_position": cache_position,
+                        "position_embeddings": position_embeddings,
+                    }
+                )
+
+                def custom_forward(*inputs):
+                    return decoder_layer(
+                        inputs[0],
+                        attention_mask=inputs[1],
+                        position_ids=inputs[2],
+                        past_key_value=inputs[3],
+                        inbatch_attn=inputs[4],
+                        cached_key_value=inputs[5],
+                        **layer_kwargs,
+                    )
+
                 layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
+                    custom_forward,
                     hidden_states,
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    inbatch_attn,
-                    cached_key_values[layer_idx] if cached_key_values is not None else None,
-                    attention_mask,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
+                    _layer_inbatch_attn,
+                    _layer_cached_kv,
                 )
             else:
                 layer_outputs = decoder_layer(
