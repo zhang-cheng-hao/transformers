@@ -55,6 +55,8 @@ from .configuration_llama import LlamaConfig
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
+_CONFIG_FOR_DOC = "LlamaConfig"
+
 
 def _oom_debug_enabled() -> bool:
     return os.environ.get("REVELA_OOM_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
