@@ -19,6 +19,7 @@
 # limitations under the License.
 import math
 import os
+from collections import defaultdict
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -57,9 +58,25 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
+_OOM_LOG_COUNTERS = defaultdict(int)
+
 
 def _oom_debug_enabled() -> bool:
     return os.environ.get("REVELA_OOM_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _oom_debug_interval() -> int:
+    try:
+        return max(int(os.environ.get("REVELA_OOM_DEBUG_INTERVAL", "16")), 1)
+    except ValueError:
+        return 16
+
+
+def _oom_debug_low_free_mib() -> float:
+    try:
+        return float(os.environ.get("REVELA_OOM_DEBUG_LOW_FREE_MIB", "2048"))
+    except ValueError:
+        return 2048.0
 
 
 def _tensor_debug_summary(name: str, tensor: Optional[torch.Tensor]) -> str:
@@ -86,14 +103,40 @@ def _cuda_mem_summary(device: Optional[torch.device]) -> str:
     )
 
 
-def _log_cuda_mem(tag: str, device: Optional[torch.device], **extra) -> None:
+def _should_log_cuda_mem(tag: str, device: Optional[torch.device], force: bool = False) -> bool:
+    if force:
+        return True
+    if device is None or device.type != "cuda" or not torch.cuda.is_available():
+        return True
+    _OOM_LOG_COUNTERS[tag] += 1
+    free_mib = torch.cuda.mem_get_info(device)[0] / (1024 ** 2)
+    return free_mib <= _oom_debug_low_free_mib() or (_OOM_LOG_COUNTERS[tag] % _oom_debug_interval() == 0)
+
+
+def _log_cuda_mem(tag: str, device: Optional[torch.device], force: bool = False, **extra) -> None:
     if not _oom_debug_enabled():
+        return
+    if not _should_log_cuda_mem(tag, device, force=force):
         return
     extra_str = ", ".join(f"{k}={v}" for k, v in extra.items())
     message = f"[{tag}] {_cuda_mem_summary(device)}"
     if extra_str:
         message = f"{message} | {extra_str}"
     logger.warning(message)
+
+
+def _env_chunk_size(name: str, default: int, upper_bound: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    value = max(value, 1)
+    return min(value, upper_bound)
+
+
+def _iter_chunk_slices(length: int, chunk_size: int):
+    for start in range(0, length, chunk_size):
+        yield slice(start, min(length, start + chunk_size))
 
 
 
@@ -1069,48 +1112,58 @@ def _compute_exact_neighbor_output(
     disable_v_norm: bool,
     token_prune_cfg: Optional[dict] = None,
 ) -> torch.Tensor:
-    sel_keys, sel_values, sel_pad_mask = _gather_inbatch_tensors(
-        cached_keys,
-        cached_values,
-        original_attention_mask,
-        neighbor_idx,
-    )
-    if _oom_debug_enabled():
-        _log_cuda_mem(
-            "llama.exact.after_gather",
-            query_states.device,
-            query=_tensor_debug_summary("query_states", query_states),
-            keys=_tensor_debug_summary("sel_keys", sel_keys),
-            values=_tensor_debug_summary("sel_values", sel_values),
-            mask=None if sel_pad_mask is None else _tensor_debug_summary("sel_pad_mask", sel_pad_mask),
+    batch_size, fanout = neighbor_idx.shape
+    chunk_size = _env_chunk_size("REVELA_EXACT_GATHER_CHUNK", 2, fanout)
+    total_ctx = torch.zeros_like(query_states)
+
+    for chunk_slice in _iter_chunk_slices(fanout, chunk_size):
+        chunk_neighbor_idx = neighbor_idx[:, chunk_slice]
+        chunk_neighbor_weight = neighbor_weight[:, chunk_slice]
+        sel_keys, sel_values, sel_pad_mask = _gather_inbatch_tensors(
+            cached_keys,
+            cached_values,
+            original_attention_mask,
+            chunk_neighbor_idx,
         )
-    token_keep_idx = _compute_exact_token_keep_idx(sel_keys, sel_values, sel_pad_mask, token_prune_cfg)
-    if token_keep_idx is not None:
-        sel_keys = _gather_token_subset(sel_keys, token_keep_idx)
-        sel_values = _gather_token_subset(sel_values, token_keep_idx)
+        if _oom_debug_enabled():
+            _log_cuda_mem(
+                "llama.exact.after_gather",
+                query_states.device,
+                chunk=str(chunk_slice),
+                query=_tensor_debug_summary("query_states", query_states),
+                keys=_tensor_debug_summary("sel_keys", sel_keys),
+                values=_tensor_debug_summary("sel_values", sel_values),
+                mask=None if sel_pad_mask is None else _tensor_debug_summary("sel_pad_mask", sel_pad_mask),
+            )
+        token_keep_idx = _compute_exact_token_keep_idx(sel_keys, sel_values, sel_pad_mask, token_prune_cfg)
+        if token_keep_idx is not None:
+            sel_keys = _gather_token_subset(sel_keys, token_keep_idx)
+            sel_values = _gather_token_subset(sel_values, token_keep_idx)
+            if sel_pad_mask is not None:
+                sel_pad_mask = torch.gather(sel_pad_mask, dim=2, index=token_keep_idx)
+
+        q = query_states.unsqueeze(1)
+        inb_scores = torch.matmul(q, sel_keys.transpose(-2, -1)) / math.sqrt(head_dim)
+
         if sel_pad_mask is not None:
-            sel_pad_mask = torch.gather(sel_pad_mask, dim=2, index=token_keep_idx)
+            min_val = torch.finfo(inb_scores.dtype).min
+            add_mask = sel_pad_mask[:, :, None, None, :]
+            add_mask = add_mask.to(inb_scores.dtype).masked_fill(add_mask == 0, min_val)
+            inb_scores = inb_scores + add_mask
 
-    q = query_states.unsqueeze(1)
-    inb_scores = torch.matmul(q, sel_keys.transpose(-2, -1)) / math.sqrt(head_dim)
+        inb_probs = nn.functional.softmax(inb_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        inb_probs = nn.functional.dropout(inb_probs, p=attention_dropout, training=training)
+        inb_ctx = torch.matmul(inb_probs, sel_values)
 
-    if sel_pad_mask is not None:
-        min_val = torch.finfo(inb_scores.dtype).min
-        add_mask = sel_pad_mask[:, :, None, None, :]
-        add_mask = add_mask.to(inb_scores.dtype).masked_fill(add_mask == 0, min_val)
-        inb_scores = inb_scores + add_mask
+        if not disable_v_norm:
+            v_norm = torch.norm(sel_values, p=2, dim=-1, keepdim=True)
+            wv_norm = torch.matmul(inb_probs, v_norm)
+            inb_ctx = inb_ctx / (wv_norm + 1e-6)
 
-    inb_probs = nn.functional.softmax(inb_scores, dim=-1, dtype=torch.float32).to(q.dtype)
-    inb_probs = nn.functional.dropout(inb_probs, p=attention_dropout, training=training)
-    inb_ctx = torch.matmul(inb_probs, sel_values)
+        comb_w = chunk_neighbor_weight.type_as(query_states)[:, :, None, None, None]
+        total_ctx = total_ctx + (inb_ctx * comb_w).sum(dim=1)
 
-    if not disable_v_norm:
-        v_norm = torch.norm(sel_values, p=2, dim=-1, keepdim=True)
-        wv_norm = torch.matmul(inb_probs, v_norm)
-        inb_ctx = inb_ctx / (wv_norm + 1e-6)
-
-    comb_w = neighbor_weight.type_as(query_states)[:, :, None, None, None]
-    return (inb_ctx * comb_w).sum(dim=1)
+    return total_ctx
 
 
 def _compute_tail_pooled_output(
@@ -1181,62 +1234,77 @@ def _compute_grouped_tail_pooled_output(
     slot_mode: str,
     slot_count: int,
 ) -> torch.Tensor:
-    sel_keys, sel_values, sel_pad_mask = _gather_grouped_inbatch_tensors(
-        cached_keys,
-        cached_values,
-        original_attention_mask,
-        tail_group_idx,
-    )
-    if _oom_debug_enabled():
-        _log_cuda_mem(
-            "llama.grouped_tail.after_gather",
-            query_states.device,
-            query=_tensor_debug_summary("query_states", query_states),
-            keys=_tensor_debug_summary("sel_keys", sel_keys),
-            values=_tensor_debug_summary("sel_values", sel_values),
-            mask=None if sel_pad_mask is None else _tensor_debug_summary("sel_pad_mask", sel_pad_mask),
+    batch_size, group_count, _ = tail_group_idx.shape
+    chunk_size = _env_chunk_size("REVELA_TAIL_GROUP_GATHER_CHUNK", 1, group_count)
+    total_ctx = torch.zeros_like(query_states)
+
+    for chunk_slice in _iter_chunk_slices(group_count, chunk_size):
+        chunk_tail_group_idx = tail_group_idx[:, chunk_slice, :]
+        chunk_tail_group_weight = tail_group_weight[:, chunk_slice, :]
+        chunk_tail_group_mass = tail_group_mass[:, chunk_slice]
+        chunk_tail_group_valid_mask = (
+            None if tail_group_valid_mask is None else tail_group_valid_mask[:, chunk_slice, :]
         )
-    mix_w = tail_group_weight.type_as(query_states)[:, :, :, None, None, None]
 
-    grouped_mask = None
-    if sel_pad_mask is not None:
-        valid = sel_pad_mask[:, :, :, None, :, None].to(query_states.dtype)
-        norm = (mix_w * valid).sum(dim=2).clamp_min(1e-6)
-        grouped_keys = (sel_keys * mix_w * valid).sum(dim=2) / norm
-        grouped_values = (sel_values * mix_w * valid).sum(dim=2) / norm
-        grouped_mask = sel_pad_mask.any(dim=2)
-    else:
-        grouped_keys = (sel_keys * mix_w).sum(dim=2)
-        grouped_values = (sel_values * mix_w).sum(dim=2)
+        sel_keys, sel_values, sel_pad_mask = _gather_grouped_inbatch_tensors(
+            cached_keys,
+            cached_values,
+            original_attention_mask,
+            chunk_tail_group_idx,
+        )
+        if _oom_debug_enabled():
+            _log_cuda_mem(
+                "llama.grouped_tail.after_gather",
+                query_states.device,
+                chunk=str(chunk_slice),
+                query=_tensor_debug_summary("query_states", query_states),
+                keys=_tensor_debug_summary("sel_keys", sel_keys),
+                values=_tensor_debug_summary("sel_values", sel_values),
+                mask=None if sel_pad_mask is None else _tensor_debug_summary("sel_pad_mask", sel_pad_mask),
+            )
+        mix_w = chunk_tail_group_weight.type_as(query_states)[:, :, :, None, None, None]
 
-    pooled_group_mask = grouped_mask
-    grouped_keys, pooled_group_mask = _pool_group_slots(grouped_keys, grouped_mask, slot_mode, slot_count)
-    grouped_values, _ = _pool_group_slots(grouped_values, grouped_mask, slot_mode, slot_count)
+        grouped_mask = None
+        if sel_pad_mask is not None:
+            valid = sel_pad_mask[:, :, :, None, :, None].to(query_states.dtype)
+            norm = (mix_w * valid).sum(dim=2).clamp_min(1e-6)
+            grouped_keys = (sel_keys * mix_w * valid).sum(dim=2) / norm
+            grouped_values = (sel_values * mix_w * valid).sum(dim=2) / norm
+            grouped_mask = sel_pad_mask.any(dim=2)
+        else:
+            grouped_keys = (sel_keys * mix_w).sum(dim=2)
+            grouped_values = (sel_values * mix_w).sum(dim=2)
 
-    q = query_states.unsqueeze(1)
-    grouped_scores = torch.matmul(q, grouped_keys.transpose(-2, -1)) / math.sqrt(head_dim)
+        pooled_group_mask = grouped_mask
+        grouped_keys, pooled_group_mask = _pool_group_slots(grouped_keys, grouped_mask, slot_mode, slot_count)
+        grouped_values, _ = _pool_group_slots(grouped_values, grouped_mask, slot_mode, slot_count)
 
-    if pooled_group_mask is not None:
-        min_val = torch.finfo(grouped_scores.dtype).min
-        add_mask = pooled_group_mask[:, :, None, None, :]
-        add_mask = add_mask.to(grouped_scores.dtype).masked_fill(add_mask == 0, min_val)
-        grouped_scores = grouped_scores + add_mask
+        q = query_states.unsqueeze(1)
+        grouped_scores = torch.matmul(q, grouped_keys.transpose(-2, -1)) / math.sqrt(head_dim)
 
-    grouped_probs = nn.functional.softmax(grouped_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    grouped_probs = nn.functional.dropout(grouped_probs, p=attention_dropout, training=training)
-    grouped_ctx = torch.matmul(grouped_probs, grouped_values)
+        if pooled_group_mask is not None:
+            min_val = torch.finfo(grouped_scores.dtype).min
+            add_mask = pooled_group_mask[:, :, None, None, :]
+            add_mask = add_mask.to(grouped_scores.dtype).masked_fill(add_mask == 0, min_val)
+            grouped_scores = grouped_scores + add_mask
 
-    if not disable_v_norm:
-        grouped_v_norm = torch.norm(grouped_values, p=2, dim=-1, keepdim=True)
-        grouped_wv_norm = torch.matmul(grouped_probs, grouped_v_norm)
-        grouped_ctx = grouped_ctx / (grouped_wv_norm + 1e-6)
+        grouped_probs = nn.functional.softmax(grouped_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        grouped_probs = nn.functional.dropout(grouped_probs, p=attention_dropout, training=training)
+        grouped_ctx = torch.matmul(grouped_probs, grouped_values)
 
-    if tail_group_valid_mask is not None:
-        active_group_mask = tail_group_valid_mask.any(dim=-1).type_as(query_states)
-        tail_group_mass = tail_group_mass * active_group_mask
+        if not disable_v_norm:
+            grouped_v_norm = torch.norm(grouped_values, p=2, dim=-1, keepdim=True)
+            grouped_wv_norm = torch.matmul(grouped_probs, grouped_v_norm)
+            grouped_ctx = grouped_ctx / (grouped_wv_norm + 1e-6)
 
-    group_mass = tail_group_mass.type_as(query_states)[:, :, None, None, None]
-    return (grouped_ctx * group_mass).sum(dim=1)
+        if chunk_tail_group_valid_mask is not None:
+            active_group_mask = chunk_tail_group_valid_mask.any(dim=-1).type_as(query_states)
+            chunk_tail_group_mass = chunk_tail_group_mass * active_group_mask
+
+        group_mass = chunk_tail_group_mass.type_as(query_states)[:, :, None, None, None]
+        total_ctx = total_ctx + (grouped_ctx * group_mass).sum(dim=1)
+
+    return total_ctx
 
 class LlamaSdpaAttention(LlamaAttention):
     """
@@ -1634,7 +1702,7 @@ class LlamaDecoderLayer(nn.Module):
         try:
             hidden_states = self.mlp(hidden_states)
         except torch.OutOfMemoryError:
-            _log_cuda_mem("llama.decoder_layer.mlp_oom", hidden_states.device, layer_idx=self.self_attn.layer_idx, hidden_states=_tensor_debug_summary("hidden_states", hidden_states))
+            _log_cuda_mem("llama.decoder_layer.mlp_oom", hidden_states.device, force=True, layer_idx=self.self_attn.layer_idx, hidden_states=_tensor_debug_summary("hidden_states", hidden_states))
             raise
         hidden_states = residual + hidden_states
 
