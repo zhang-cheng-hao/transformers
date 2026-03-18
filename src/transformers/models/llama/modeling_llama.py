@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -54,7 +55,45 @@ from .configuration_llama import LlamaConfig
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "LlamaConfig"
+
+def _oom_debug_enabled() -> bool:
+    return os.environ.get("REVELA_OOM_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _tensor_debug_summary(name: str, tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    mib = tensor.numel() * tensor.element_size() / (1024 ** 2)
+    return f"{name}.shape={tuple(tensor.shape)},dtype={tensor.dtype},mib={mib:.2f}"
+
+
+def _cuda_mem_summary(device: Optional[torch.device]) -> str:
+    if device is None or device.type != "cuda" or not torch.cuda.is_available():
+        return "cuda_mem=unavailable"
+    alloc = torch.cuda.memory_allocated(device) / (1024 ** 2)
+    reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
+    max_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+    max_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+    free, total = torch.cuda.mem_get_info(device)
+    free /= 1024 ** 2
+    total /= 1024 ** 2
+    return (
+        f"cuda_mem(device={device},alloc={alloc:.2f}MiB,reserved={reserved:.2f}MiB,"
+        f"max_alloc={max_alloc:.2f}MiB,max_reserved={max_reserved:.2f}MiB,"
+        f"free={free:.2f}MiB,total={total:.2f}MiB)"
+    )
+
+
+def _log_cuda_mem(tag: str, device: Optional[torch.device], **extra) -> None:
+    if not _oom_debug_enabled():
+        return
+    extra_str = ", ".join(f"{k}={v}" for k, v in extra.items())
+    message = f"[{tag}] {_cuda_mem_summary(device)}"
+    if extra_str:
+        message = f"{message} | {extra_str}"
+    logger.warning(message)
+
+
 
 
 def build_inbatch_attn_layers(
@@ -1034,6 +1073,15 @@ def _compute_exact_neighbor_output(
         original_attention_mask,
         neighbor_idx,
     )
+    if _oom_debug_enabled():
+        _log_cuda_mem(
+            "llama.exact.after_gather",
+            query_states.device,
+            query=_tensor_debug_summary("query_states", query_states),
+            keys=_tensor_debug_summary("sel_keys", sel_keys),
+            values=_tensor_debug_summary("sel_values", sel_values),
+            mask=None if sel_pad_mask is None else _tensor_debug_summary("sel_pad_mask", sel_pad_mask),
+        )
     token_keep_idx = _compute_exact_token_keep_idx(sel_keys, sel_values, sel_pad_mask, token_prune_cfg)
     if token_keep_idx is not None:
         sel_keys = _gather_token_subset(sel_keys, token_keep_idx)
@@ -1137,6 +1185,15 @@ def _compute_grouped_tail_pooled_output(
         original_attention_mask,
         tail_group_idx,
     )
+    if _oom_debug_enabled():
+        _log_cuda_mem(
+            "llama.grouped_tail.after_gather",
+            query_states.device,
+            query=_tensor_debug_summary("query_states", query_states),
+            keys=_tensor_debug_summary("sel_keys", sel_keys),
+            values=_tensor_debug_summary("sel_values", sel_values),
+            mask=None if sel_pad_mask is None else _tensor_debug_summary("sel_pad_mask", sel_pad_mask),
+        )
     mix_w = tail_group_weight.type_as(query_states)[:, :, :, None, None, None]
 
     grouped_mask = None
@@ -1544,6 +1601,9 @@ class LlamaDecoderLayer(nn.Module):
         """
         residual = hidden_states
 
+        if _oom_debug_enabled():
+            _log_cuda_mem("llama.decoder_layer.before_self_attn", hidden_states.device, layer_idx=self.self_attn.layer_idx, hidden_states=_tensor_debug_summary("hidden_states", hidden_states))
+
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -1563,11 +1623,21 @@ class LlamaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
+        if _oom_debug_enabled():
+            _log_cuda_mem("llama.decoder_layer.after_self_attn", hidden_states.device, layer_idx=self.self_attn.layer_idx, hidden_states=_tensor_debug_summary("hidden_states", hidden_states))
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        try:
+            hidden_states = self.mlp(hidden_states)
+        except torch.OutOfMemoryError:
+            _log_cuda_mem("llama.decoder_layer.mlp_oom", hidden_states.device, layer_idx=self.self_attn.layer_idx, hidden_states=_tensor_debug_summary("hidden_states", hidden_states))
+            raise
         hidden_states = residual + hidden_states
+
+        if _oom_debug_enabled():
+            _log_cuda_mem("llama.decoder_layer.after_mlp", hidden_states.device, layer_idx=self.self_attn.layer_idx, hidden_states=_tensor_debug_summary("hidden_states", hidden_states))
 
         outputs = (hidden_states,)
 
