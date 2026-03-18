@@ -139,6 +139,36 @@ def _iter_chunk_slices(length: int, chunk_size: int):
         yield slice(start, min(length, start + chunk_size))
 
 
+def _chunked_attention_apply(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    head_dim: int,
+    attention_dropout: float,
+    training: bool,
+    output_dtype: torch.dtype,
+    value_norm: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    q_len = query_states.size(-2)
+    q_chunk = _env_chunk_size("REVELA_Q_ATTN_CHUNK", 32, q_len)
+    ctx_chunks = []
+    norm_chunks = [] if value_norm is not None else None
+
+    for q_slice in _iter_chunk_slices(q_len, q_chunk):
+        q_chunk_states = query_states[..., q_slice, :]
+        scores = torch.matmul(q_chunk_states, key_states.transpose(-2, -1)) / math.sqrt(head_dim)
+        if attention_mask is not None:
+            scores = scores + attention_mask
+        probs = nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(output_dtype)
+        probs = nn.functional.dropout(probs, p=attention_dropout, training=training)
+        ctx_chunks.append(torch.matmul(probs, value_states))
+        if value_norm is not None:
+            norm_chunks.append(torch.matmul(probs, value_norm))
+
+    ctx = torch.cat(ctx_chunks, dim=-2)
+    norm = torch.cat(norm_chunks, dim=-2) if norm_chunks is not None else None
+    return ctx, norm
 
 
 def build_inbatch_attn_layers(
@@ -1143,21 +1173,26 @@ def _compute_exact_neighbor_output(
                 sel_pad_mask = torch.gather(sel_pad_mask, dim=2, index=token_keep_idx)
 
         q = query_states.unsqueeze(1)
-        inb_scores = torch.matmul(q, sel_keys.transpose(-2, -1)) / math.sqrt(head_dim)
-
+        add_mask = None
         if sel_pad_mask is not None:
-            min_val = torch.finfo(inb_scores.dtype).min
+            min_val = torch.finfo(query_states.dtype).min
             add_mask = sel_pad_mask[:, :, None, None, :]
-            add_mask = add_mask.to(inb_scores.dtype).masked_fill(add_mask == 0, min_val)
-            inb_scores = inb_scores + add_mask
+            add_mask = add_mask.to(query_states.dtype).masked_fill(add_mask == 0, min_val)
 
-        inb_probs = nn.functional.softmax(inb_scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        inb_probs = nn.functional.dropout(inb_probs, p=attention_dropout, training=training)
-        inb_ctx = torch.matmul(inb_probs, sel_values)
+        v_norm = torch.norm(sel_values, p=2, dim=-1, keepdim=True) if not disable_v_norm else None
+        inb_ctx, wv_norm = _chunked_attention_apply(
+            query_states=q,
+            key_states=sel_keys,
+            value_states=sel_values,
+            attention_mask=add_mask,
+            head_dim=head_dim,
+            attention_dropout=attention_dropout,
+            training=training,
+            output_dtype=q.dtype,
+            value_norm=v_norm,
+        )
 
-        if not disable_v_norm:
-            v_norm = torch.norm(sel_values, p=2, dim=-1, keepdim=True)
-            wv_norm = torch.matmul(inb_probs, v_norm)
+        if wv_norm is not None:
             inb_ctx = inb_ctx / (wv_norm + 1e-6)
 
         comb_w = chunk_neighbor_weight.type_as(query_states)[:, :, None, None, None]
@@ -1198,21 +1233,26 @@ def _compute_tail_pooled_output(
         pooled_keys = (sel_keys * mix_w).sum(dim=1)
         pooled_values = (sel_values * mix_w).sum(dim=1)
 
-    pooled_scores = torch.matmul(query_states, pooled_keys.transpose(-2, -1)) / math.sqrt(head_dim)
-
+    add_mask = None
     if pooled_mask is not None:
-        min_val = torch.finfo(pooled_scores.dtype).min
+        min_val = torch.finfo(query_states.dtype).min
         pooled_add_mask = pooled_mask[:, None, None, :]
-        pooled_add_mask = pooled_add_mask.to(pooled_scores.dtype).masked_fill(pooled_add_mask == 0, min_val)
-        pooled_scores = pooled_scores + pooled_add_mask
+        add_mask = pooled_add_mask.to(query_states.dtype).masked_fill(pooled_add_mask == 0, min_val)
 
-    pooled_probs = nn.functional.softmax(pooled_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    pooled_probs = nn.functional.dropout(pooled_probs, p=attention_dropout, training=training)
-    pooled_ctx = torch.matmul(pooled_probs, pooled_values)
+    pooled_v_norm = torch.norm(pooled_values, p=2, dim=-1, keepdim=True) if not disable_v_norm else None
+    pooled_ctx, pooled_wv_norm = _chunked_attention_apply(
+        query_states=query_states,
+        key_states=pooled_keys,
+        value_states=pooled_values,
+        attention_mask=add_mask,
+        head_dim=head_dim,
+        attention_dropout=attention_dropout,
+        training=training,
+        output_dtype=query_states.dtype,
+        value_norm=pooled_v_norm,
+    )
 
-    if not disable_v_norm:
-        pooled_v_norm = torch.norm(pooled_values, p=2, dim=-1, keepdim=True)
-        pooled_wv_norm = torch.matmul(pooled_probs, pooled_v_norm)
+    if pooled_wv_norm is not None:
         pooled_ctx = pooled_ctx / (pooled_wv_norm + 1e-6)
 
     return pooled_ctx * tail_mass.type_as(query_states).view(-1, 1, 1, 1)
@@ -1280,21 +1320,26 @@ def _compute_grouped_tail_pooled_output(
         grouped_values, _ = _pool_group_slots(grouped_values, grouped_mask, slot_mode, slot_count)
 
         q = query_states.unsqueeze(1)
-        grouped_scores = torch.matmul(q, grouped_keys.transpose(-2, -1)) / math.sqrt(head_dim)
-
+        add_mask = None
         if pooled_group_mask is not None:
-            min_val = torch.finfo(grouped_scores.dtype).min
+            min_val = torch.finfo(query_states.dtype).min
             add_mask = pooled_group_mask[:, :, None, None, :]
-            add_mask = add_mask.to(grouped_scores.dtype).masked_fill(add_mask == 0, min_val)
-            grouped_scores = grouped_scores + add_mask
+            add_mask = add_mask.to(query_states.dtype).masked_fill(add_mask == 0, min_val)
 
-        grouped_probs = nn.functional.softmax(grouped_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        grouped_probs = nn.functional.dropout(grouped_probs, p=attention_dropout, training=training)
-        grouped_ctx = torch.matmul(grouped_probs, grouped_values)
+        grouped_v_norm = torch.norm(grouped_values, p=2, dim=-1, keepdim=True) if not disable_v_norm else None
+        grouped_ctx, grouped_wv_norm = _chunked_attention_apply(
+            query_states=q,
+            key_states=grouped_keys,
+            value_states=grouped_values,
+            attention_mask=add_mask,
+            head_dim=head_dim,
+            attention_dropout=attention_dropout,
+            training=training,
+            output_dtype=query_states.dtype,
+            value_norm=grouped_v_norm,
+        )
 
-        if not disable_v_norm:
-            grouped_v_norm = torch.norm(grouped_values, p=2, dim=-1, keepdim=True)
-            grouped_wv_norm = torch.matmul(grouped_probs, grouped_v_norm)
+        if grouped_wv_norm is not None:
             grouped_ctx = grouped_ctx / (grouped_wv_norm + 1e-6)
 
         if chunk_tail_group_valid_mask is not None:
