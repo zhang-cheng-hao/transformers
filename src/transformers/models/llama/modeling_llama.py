@@ -18,7 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -349,6 +349,143 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def _unichorus_attention(attn_module, query_hidden_states: torch.Tensor, key_value_hidden_states: torch.Tensor):
+    if query_hidden_states is None or key_value_hidden_states is None:
+        return None
+
+    bsz, q_len, _ = query_hidden_states.size()
+    kv_bsz, kv_len, _ = key_value_hidden_states.size()
+    if q_len == 0 or kv_len == 0:
+        return None
+    if kv_bsz != bsz:
+        raise ValueError(
+            f"UniChorus cross_doc_state batch mismatch: query batch={bsz}, key/value batch={kv_bsz}"
+        )
+
+    query_states = attn_module.q_proj(query_hidden_states)
+    key_states = attn_module.k_proj(key_value_hidden_states)
+    value_states = attn_module.v_proj(key_value_hidden_states)
+
+    query_states = query_states.view(bsz, q_len, attn_module.num_heads, attn_module.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, kv_len, attn_module.num_key_value_heads, attn_module.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, kv_len, attn_module.num_key_value_heads, attn_module.head_dim).transpose(1, 2)
+
+    key_states = repeat_kv(key_states, attn_module.num_key_value_groups)
+    value_states = repeat_kv(value_states, attn_module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(attn_module.head_dim)
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = F.dropout(attn_weights, p=attn_module.attention_dropout, training=attn_module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+    return attn_module.o_proj(attn_output)
+
+
+def _unichorus_neighbor_context(cross_doc_state: Optional[Dict[str, object]]):
+    if not isinstance(cross_doc_state, dict):
+        return None, None
+
+    neighbor_states = cross_doc_state.get("neighbor_compression_states")
+    if neighbor_states is None:
+        return None, None
+
+    if isinstance(neighbor_states, (list, tuple)):
+        if not neighbor_states:
+            return None, None
+        neighbor_states = torch.stack(list(neighbor_states), dim=1)
+
+    if not torch.is_tensor(neighbor_states):
+        return None, None
+
+    neighbor_weights = cross_doc_state.get("neighbor_weights")
+    if neighbor_states.dim() == 3:
+        return neighbor_states, neighbor_weights
+
+    if neighbor_states.dim() != 4:
+        return None, None
+
+    if neighbor_weights is None:
+        neighbor_weights = torch.ones(
+            neighbor_states.size(0),
+            neighbor_states.size(1),
+            device=neighbor_states.device,
+            dtype=neighbor_states.dtype,
+        )
+        neighbor_weights = neighbor_weights / neighbor_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    else:
+        if not torch.is_tensor(neighbor_weights):
+            neighbor_weights = torch.tensor(neighbor_weights, device=neighbor_states.device, dtype=neighbor_states.dtype)
+        else:
+            neighbor_weights = neighbor_weights.to(device=neighbor_states.device, dtype=neighbor_states.dtype)
+        if neighbor_weights.dim() == 1:
+            neighbor_weights = neighbor_weights.unsqueeze(0)
+        neighbor_weights = neighbor_weights / neighbor_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+    neighbor_states = (neighbor_states * neighbor_weights[:, :, None, None]).sum(dim=1)
+    return neighbor_states, None
+
+
+def _unichorus_apply_cross_doc_state(
+    attn_module,
+    hidden_states: torch.Tensor,
+    attn_output: torch.Tensor,
+    cross_doc_state: Optional[Dict[str, object]],
+):
+    if not isinstance(cross_doc_state, dict):
+        return attn_output
+    if cross_doc_state.get("mode", "unichorus") not in (None, "unichorus"):
+        return attn_output
+
+    num_compression_tokens = int(cross_doc_state.get("num_compression_tokens", 0) or 0)
+    if num_compression_tokens <= 0 or hidden_states.size(1) < num_compression_tokens:
+        return attn_output
+
+    layer_idx = getattr(attn_module, "layer_idx", None)
+    routed_layers = cross_doc_state.get("routed_layer_indices")
+    if routed_layers is not None and layer_idx is not None:
+        try:
+            layer_enabled = layer_idx in routed_layers
+        except TypeError:
+            layer_enabled = layer_idx in set(routed_layers)
+        if not layer_enabled:
+            return attn_output
+
+    compression_hidden_states = hidden_states[:, -num_compression_tokens:, :]
+
+    use_route_adapter = bool(cross_doc_state.get("use_route_adapter", False))
+    route_adapter_layers = cross_doc_state.get("route_adapter_layers")
+    if route_adapter_layers is not None and layer_idx is not None:
+        try:
+            adapter_enabled = layer_idx in route_adapter_layers
+        except TypeError:
+            adapter_enabled = layer_idx in set(route_adapter_layers)
+    else:
+        adapter_enabled = True
+
+    if use_route_adapter and adapter_enabled:
+        route_hidden_states = compression_hidden_states + _unichorus_attention(
+            attn_module,
+            compression_hidden_states,
+            compression_hidden_states,
+        )
+    else:
+        route_hidden_states = compression_hidden_states
+
+    neighbor_states, _ = _unichorus_neighbor_context(cross_doc_state)
+    if neighbor_states is None:
+        return attn_output
+
+    cross_doc_output = _unichorus_attention(attn_module, route_hidden_states, neighbor_states)
+    if cross_doc_output is None:
+        return attn_output
+
+    updated_attn_output = attn_output.clone()
+    updated_attn_output[:, -num_compression_tokens:, :] = (
+        updated_attn_output[:, -num_compression_tokens:, :] + cross_doc_output
+    )
+    return updated_attn_output
+
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -391,6 +528,7 @@ class LlamaAttention(nn.Module):
         inbatch_attn: Optional[torch.Tensor] = None, # B x B
         cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         original_attention_mask: Optional[torch.Tensor] = None, # B x L
+        cross_doc_state: Optional[Dict[str, object]] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -541,6 +679,8 @@ class LlamaAttention(nn.Module):
         else:
             attn_output = self.o_proj(attn_output)
 
+        attn_output = _unichorus_apply_cross_doc_state(self, hidden_states, attn_output, cross_doc_state)
+
         if not output_attentions:
             attn_weights = None
 
@@ -572,6 +712,7 @@ class LlamaFlashAttention2(LlamaAttention):
         inbatch_attn: Optional[torch.Tensor] = None, # B x B
         cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         original_attention_mask: Optional[torch.Tensor] = None, # B x L
+        cross_doc_state: Optional[Dict[str, object]] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -771,6 +912,7 @@ class LlamaFlashAttention2(LlamaAttention):
         
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        attn_output = _unichorus_apply_cross_doc_state(self, hidden_states, attn_output, cross_doc_state)
 
         if not output_attentions:
             attn_weights = None
@@ -806,6 +948,7 @@ class LlamaSdpaAttention(LlamaAttention):
         inbatch_attn: Optional[torch.Tensor] = None, # B x B
         cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         original_attention_mask: Optional[torch.Tensor] = None, # B x L
+        cross_doc_state: Optional[Dict[str, object]] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -827,6 +970,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 inbatch_attn=inbatch_attn,
                 cached_key_value=cached_key_value,
                 original_attention_mask=original_attention_mask,
+                cross_doc_state=cross_doc_state,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
@@ -1042,6 +1186,7 @@ class LlamaSdpaAttention(LlamaAttention):
         attn_output = attn_output.view(bsz, q_len, -1)
 
         attn_output = self.o_proj(attn_output)
+        attn_output = _unichorus_apply_cross_doc_state(self, hidden_states, attn_output, cross_doc_state)
 
         return attn_output, None, past_key_value
 
@@ -1072,6 +1217,7 @@ class LlamaDecoderLayer(nn.Module):
         inbatch_attn: Optional[torch.Tensor] = None,
         cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         original_attention_mask: Optional[torch.Tensor] = None,
+        cross_doc_state: Optional[Dict[str, object]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -1113,6 +1259,7 @@ class LlamaDecoderLayer(nn.Module):
             inbatch_attn=inbatch_attn,
             cached_key_value=cached_key_value,
             original_attention_mask=original_attention_mask,
+            cross_doc_state=cross_doc_state,
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
@@ -1303,6 +1450,7 @@ class LlamaModel(LlamaPreTrainedModel):
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inbatch_attn: Optional[torch.Tensor] = None,
         cached_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        cross_doc_state: Optional[Dict[str, object]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -1382,6 +1530,15 @@ class LlamaModel(LlamaPreTrainedModel):
 
             _layer_inbatch_attn = inbatch_attn if _use_inbatch else None
             _layer_cached_kv = cached_key_values[layer_idx] if _use_inbatch else None
+            _use_cross_doc = cross_doc_state is not None
+            if _use_cross_doc and isinstance(cross_doc_state, dict):
+                routed_layers = cross_doc_state.get("routed_layer_indices")
+                if routed_layers is not None:
+                    try:
+                        _use_cross_doc = layer_idx in routed_layers
+                    except TypeError:
+                        _use_cross_doc = layer_idx in set(routed_layers)
+            _layer_cross_doc_state = cross_doc_state if _use_cross_doc else None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1393,6 +1550,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     _layer_inbatch_attn,
                     _layer_cached_kv,
                     inbatch_original_attention_mask,
+                    _layer_cross_doc_state,
                     output_attentions,
                     use_cache,
                     cache_position,
@@ -1410,6 +1568,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     inbatch_attn=_layer_inbatch_attn,    # ← CHANGED: gated
                     cached_key_value=_layer_cached_kv,    # ← CHANGED: gated
                     original_attention_mask=inbatch_original_attention_mask,
+                    cross_doc_state=_layer_cross_doc_state,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -1550,6 +1709,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.LongTensor] = None,
         inbatch_attn: Optional[torch.Tensor] = None,
         cached_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        cross_doc_state: Optional[Dict[str, object]] = None,
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -1605,6 +1765,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inbatch_attn=inbatch_attn,
             cached_key_values=cached_key_values,
+            cross_doc_state=cross_doc_state,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,

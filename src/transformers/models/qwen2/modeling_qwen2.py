@@ -20,7 +20,7 @@
 """PyTorch Qwen2 model."""
 
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -289,6 +289,143 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def _unichorus_attention(attn_module, query_hidden_states: torch.Tensor, key_value_hidden_states: torch.Tensor):
+    if query_hidden_states is None or key_value_hidden_states is None:
+        return None
+
+    bsz, q_len, _ = query_hidden_states.size()
+    kv_bsz, kv_len, _ = key_value_hidden_states.size()
+    if q_len == 0 or kv_len == 0:
+        return None
+    if kv_bsz != bsz:
+        raise ValueError(
+            f"UniChorus cross_doc_state batch mismatch: query batch={bsz}, key/value batch={kv_bsz}"
+        )
+
+    query_states = attn_module.q_proj(query_hidden_states)
+    key_states = attn_module.k_proj(key_value_hidden_states)
+    value_states = attn_module.v_proj(key_value_hidden_states)
+
+    query_states = query_states.view(bsz, q_len, attn_module.num_heads, attn_module.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, kv_len, attn_module.num_key_value_heads, attn_module.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, kv_len, attn_module.num_key_value_heads, attn_module.head_dim).transpose(1, 2)
+
+    key_states = repeat_kv(key_states, attn_module.num_key_value_groups)
+    value_states = repeat_kv(value_states, attn_module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(attn_module.head_dim)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=attn_module.attention_dropout, training=attn_module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+    return attn_module.o_proj(attn_output)
+
+
+def _unichorus_neighbor_context(cross_doc_state: Optional[Dict[str, object]]):
+    if not isinstance(cross_doc_state, dict):
+        return None, None
+
+    neighbor_states = cross_doc_state.get("neighbor_compression_states")
+    if neighbor_states is None:
+        return None, None
+
+    if isinstance(neighbor_states, (list, tuple)):
+        if not neighbor_states:
+            return None, None
+        neighbor_states = torch.stack(list(neighbor_states), dim=1)
+
+    if not torch.is_tensor(neighbor_states):
+        return None, None
+
+    neighbor_weights = cross_doc_state.get("neighbor_weights")
+    if neighbor_states.dim() == 3:
+        return neighbor_states, neighbor_weights
+
+    if neighbor_states.dim() != 4:
+        return None, None
+
+    if neighbor_weights is None:
+        neighbor_weights = torch.ones(
+            neighbor_states.size(0),
+            neighbor_states.size(1),
+            device=neighbor_states.device,
+            dtype=neighbor_states.dtype,
+        )
+        neighbor_weights = neighbor_weights / neighbor_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    else:
+        if not torch.is_tensor(neighbor_weights):
+            neighbor_weights = torch.tensor(neighbor_weights, device=neighbor_states.device, dtype=neighbor_states.dtype)
+        else:
+            neighbor_weights = neighbor_weights.to(device=neighbor_states.device, dtype=neighbor_states.dtype)
+        if neighbor_weights.dim() == 1:
+            neighbor_weights = neighbor_weights.unsqueeze(0)
+        neighbor_weights = neighbor_weights / neighbor_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+    neighbor_states = (neighbor_states * neighbor_weights[:, :, None, None]).sum(dim=1)
+    return neighbor_states, None
+
+
+def _unichorus_apply_cross_doc_state(
+    attn_module,
+    hidden_states: torch.Tensor,
+    attn_output: torch.Tensor,
+    cross_doc_state: Optional[Dict[str, object]],
+):
+    if not isinstance(cross_doc_state, dict):
+        return attn_output
+    if cross_doc_state.get("mode", "unichorus") not in (None, "unichorus"):
+        return attn_output
+
+    num_compression_tokens = int(cross_doc_state.get("num_compression_tokens", 0) or 0)
+    if num_compression_tokens <= 0 or hidden_states.size(1) < num_compression_tokens:
+        return attn_output
+
+    layer_idx = getattr(attn_module, "layer_idx", None)
+    routed_layers = cross_doc_state.get("routed_layer_indices")
+    if routed_layers is not None and layer_idx is not None:
+        try:
+            layer_enabled = layer_idx in routed_layers
+        except TypeError:
+            layer_enabled = layer_idx in set(routed_layers)
+        if not layer_enabled:
+            return attn_output
+
+    compression_hidden_states = hidden_states[:, -num_compression_tokens:, :]
+
+    use_route_adapter = bool(cross_doc_state.get("use_route_adapter", False))
+    route_adapter_layers = cross_doc_state.get("route_adapter_layers")
+    if route_adapter_layers is not None and layer_idx is not None:
+        try:
+            adapter_enabled = layer_idx in route_adapter_layers
+        except TypeError:
+            adapter_enabled = layer_idx in set(route_adapter_layers)
+    else:
+        adapter_enabled = True
+
+    if use_route_adapter and adapter_enabled:
+        route_hidden_states = compression_hidden_states + _unichorus_attention(
+            attn_module,
+            compression_hidden_states,
+            compression_hidden_states,
+        )
+    else:
+        route_hidden_states = compression_hidden_states
+
+    neighbor_states, _ = _unichorus_neighbor_context(cross_doc_state)
+    if neighbor_states is None:
+        return attn_output
+
+    cross_doc_output = _unichorus_attention(attn_module, route_hidden_states, neighbor_states)
+    if cross_doc_output is None:
+        return attn_output
+
+    updated_attn_output = attn_output.clone()
+    updated_attn_output[:, -num_compression_tokens:, :] = (
+        updated_attn_output[:, -num_compression_tokens:, :] + cross_doc_output
+    )
+    return updated_attn_output
+
+
 class Qwen2Attention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
@@ -328,6 +465,64 @@ class Qwen2Attention(nn.Module):
 
         self.rotary_emb = Qwen2RotaryEmbedding(config=self.config)
 
+    def _apply_unichorus_cross_doc(
+        self,
+        hidden_states: torch.Tensor,
+        attn_output: torch.Tensor,
+        cross_doc_state: Optional[dict],
+    ) -> torch.Tensor:
+        if not cross_doc_state or cross_doc_state.get("mode") != "unichorus":
+            return attn_output
+
+        routed_layers = cross_doc_state.get("routed_layer_indices")
+        if routed_layers and self.layer_idx not in routed_layers:
+            return attn_output
+
+        num_compression_tokens = int(cross_doc_state.get("num_compression_tokens", 0))
+        if num_compression_tokens <= 0 or hidden_states.size(1) < num_compression_tokens:
+            return attn_output
+
+        neighbor_states = cross_doc_state.get("neighbor_compression_states")
+        neighbor_weights = cross_doc_state.get("neighbor_weights")
+        if neighbor_states is None or neighbor_weights is None or neighbor_states.size(1) == 0:
+            return attn_output
+
+        bsz, top_m, num_neighbor_tokens, hidden_size = neighbor_states.shape
+        comp_states = hidden_states[:, -num_compression_tokens:, :]
+        route_states = comp_states
+        if cross_doc_state.get("route_adapter_layers", 0) > 0:
+            route_scores = torch.matmul(route_states, route_states.transpose(1, 2)) / math.sqrt(route_states.size(-1))
+            route_scores = nn.functional.softmax(route_scores, dim=-1, dtype=torch.float32).to(route_states.dtype)
+            route_states = torch.matmul(route_scores, route_states)
+
+        route_queries = self.q_proj(route_states)
+        route_queries = route_queries.view(bsz, num_compression_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+
+        flat_neighbors = neighbor_states.reshape(bsz * top_m, num_neighbor_tokens, hidden_size)
+        neighbor_keys = self.k_proj(flat_neighbors)
+        neighbor_values = self.v_proj(flat_neighbors)
+        neighbor_keys = neighbor_keys.view(
+            bsz * top_m, num_neighbor_tokens, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        neighbor_values = neighbor_values.view(
+            bsz * top_m, num_neighbor_tokens, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        neighbor_keys = repeat_kv(neighbor_keys, self.num_key_value_groups).view(
+            bsz, top_m, self.num_heads, num_neighbor_tokens, self.head_dim
+        )
+        neighbor_values = repeat_kv(neighbor_values, self.num_key_value_groups).view(
+            bsz, top_m, self.num_heads, num_neighbor_tokens, self.head_dim
+        )
+
+        route_attn = torch.matmul(route_queries.unsqueeze(1), neighbor_keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        route_attn = nn.functional.softmax(route_attn, dim=-1, dtype=torch.float32).to(route_queries.dtype)
+        route_attn = nn.functional.dropout(route_attn, p=self.attention_dropout, training=self.training)
+        route_ctx = torch.matmul(route_attn, neighbor_values)
+        route_ctx = route_ctx * neighbor_weights[:, :, None, None, None].to(route_ctx.dtype)
+        route_ctx = route_ctx.sum(dim=1)
+        attn_output[:, :, -num_compression_tokens:, :] = attn_output[:, :, -num_compression_tokens:, :] + route_ctx
+        return attn_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -338,6 +533,7 @@ class Qwen2Attention(nn.Module):
         inbatch_attn: Optional[torch.Tensor] = None, # B x B
         cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         original_attention_mask: Optional[torch.Tensor] = None, # B x L
+        cross_doc_state: Optional[Dict[str, object]] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -426,6 +622,7 @@ class Qwen2Attention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
+        attn_output = _unichorus_apply_cross_doc_state(self, hidden_states, attn_output, cross_doc_state)
 
         if not output_attentions:
             attn_weights = None
@@ -461,6 +658,8 @@ class Qwen2FlashAttention2(Qwen2Attention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        cross_doc_state: Optional[Dict[str, object]] = None,
+        **kwargs,
     ):
         bsz, q_len, _ = hidden_states.size()
 
@@ -571,6 +770,7 @@ class Qwen2FlashAttention2(Qwen2Attention):
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
+        attn_output = _unichorus_apply_cross_doc_state(self, hidden_states, attn_output, cross_doc_state)
 
         if not output_attentions:
             attn_weights = None
@@ -607,6 +807,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
         inbatch_attn: Optional[torch.Tensor] = None, # B x B
         cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         original_attention_mask: Optional[torch.Tensor] = None, # B x L
+        cross_doc_state: Optional[Dict[str, object]] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -628,6 +829,8 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 inbatch_attn=inbatch_attn,
                 cached_key_value=cached_key_value,
                 original_attention_mask=original_attention_mask,
+                cross_doc_state=cross_doc_state,
+                **kwargs,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -774,6 +977,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
+        attn_output = _unichorus_apply_cross_doc_state(self, hidden_states, attn_output, cross_doc_state)
 
         return attn_output, None, past_key_value
 
@@ -810,6 +1014,7 @@ class Qwen2DecoderLayer(nn.Module):
         inbatch_attn: Optional[torch.Tensor] = None,
         cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         original_attention_mask: Optional[torch.Tensor] = None,
+        cross_doc_state: Optional[Dict[str, object]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -852,6 +1057,7 @@ class Qwen2DecoderLayer(nn.Module):
             inbatch_attn=inbatch_attn,
             cached_key_value=cached_key_value,
             original_attention_mask=original_attention_mask,
+            cross_doc_state=cross_doc_state,
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
@@ -1041,6 +1247,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inbatch_attn: Optional[torch.Tensor] = None,
         cached_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        cross_doc_state: Optional[Dict[str, object]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -1120,9 +1327,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 and cached_key_values is not None
                 and (inbatch_attn_layers is None or layer_idx in inbatch_attn_layers)
             )
+            _use_cross_doc = cross_doc_state is not None
+            if _use_cross_doc and isinstance(cross_doc_state, dict):
+                routed_layers = cross_doc_state.get("routed_layer_indices")
+                if routed_layers is not None and layer_idx not in routed_layers:
+                    _use_cross_doc = False
 
             _layer_inbatch_attn = inbatch_attn if _use_inbatch else None
             _layer_cached_kv = cached_key_values[layer_idx] if _use_inbatch else None
+            _layer_cross_doc_state = cross_doc_state if _use_cross_doc else None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1134,6 +1347,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     _layer_inbatch_attn,
                     _layer_cached_kv,
                     inbatch_original_attention_mask,
+                    _layer_cross_doc_state,
                     output_attentions,
                     use_cache,
                     cache_position,
@@ -1149,6 +1363,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     inbatch_attn=_layer_inbatch_attn,
                     cached_key_value=_layer_cached_kv,
                     original_attention_mask=inbatch_original_attention_mask,
+                    cross_doc_state=_layer_cross_doc_state,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -1290,6 +1505,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.LongTensor] = None,
         inbatch_attn: Optional[torch.Tensor] = None,
         cached_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        cross_doc_state: Optional[Dict[str, object]] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -1346,6 +1562,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inbatch_attn=inbatch_attn,
             cached_key_values=cached_key_values,
+            cross_doc_state=cross_doc_state,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
