@@ -379,6 +379,9 @@ def _unichorus_apply_cross_doc_state(
     num_compression_tokens = int(cross_doc_state.get("num_compression_tokens", 0) or 0)
     if num_compression_tokens <= 0 or hidden_states.size(1) < num_compression_tokens:
         return attn_output
+    body_seq_len = hidden_states.size(1) - num_compression_tokens
+    if body_seq_len <= 0:
+        return attn_output
 
     layer_idx = getattr(attn_module, "layer_idx", None)
     routed_layers = cross_doc_state.get("routed_layer_indices")
@@ -390,38 +393,19 @@ def _unichorus_apply_cross_doc_state(
         if not layer_enabled:
             return attn_output
 
-    compression_hidden_states = hidden_states[:, -num_compression_tokens:, :]
-
-    use_route_adapter = bool(cross_doc_state.get("use_route_adapter", False))
-    route_adapter_layers = cross_doc_state.get("route_adapter_layers")
-    if route_adapter_layers is not None and layer_idx is not None:
-        try:
-            adapter_enabled = layer_idx in route_adapter_layers
-        except TypeError:
-            adapter_enabled = layer_idx in set(route_adapter_layers)
-    else:
-        adapter_enabled = True
-
-    if use_route_adapter and adapter_enabled:
-        route_hidden_states = compression_hidden_states + _unichorus_attention(
-            attn_module,
-            compression_hidden_states,
-            compression_hidden_states,
-        )
-    else:
-        route_hidden_states = compression_hidden_states
+    body_hidden_states = hidden_states[:, :-num_compression_tokens, :]
 
     neighbor_states, _ = _unichorus_neighbor_context(cross_doc_state)
     if neighbor_states is None:
         return attn_output
 
-    cross_doc_output = _unichorus_attention(attn_module, route_hidden_states, neighbor_states)
+    cross_doc_output = _unichorus_attention(attn_module, body_hidden_states, neighbor_states)
     if cross_doc_output is None:
         return attn_output
 
     updated_attn_output = attn_output.clone()
-    updated_attn_output[:, -num_compression_tokens:, :] = (
-        updated_attn_output[:, -num_compression_tokens:, :] + cross_doc_output
+    updated_attn_output[:, :-num_compression_tokens, :] = (
+        updated_attn_output[:, :-num_compression_tokens, :] + cross_doc_output
     )
     return updated_attn_output
 
