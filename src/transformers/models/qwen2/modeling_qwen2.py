@@ -403,6 +403,18 @@ def _unichorus_apply_cross_doc_state(
     if cross_doc_output is None:
         return attn_output
 
+    diagnostics = cross_doc_state.setdefault("_diagnostics", {})
+    with torch.no_grad():
+        body_norm = body_hidden_states.norm(dim=-1).mean()
+        neighbor_norm = neighbor_states.norm(dim=-1).mean()
+        cross_doc_norm = cross_doc_output.norm(dim=-1).mean()
+        ratio = cross_doc_norm / body_norm.clamp(min=1e-8)
+        diagnostics["cross_doc_output_norm_sum"] = diagnostics.get("cross_doc_output_norm_sum", 0.0) + float(cross_doc_norm.item())
+        diagnostics["body_hidden_norm_sum"] = diagnostics.get("body_hidden_norm_sum", 0.0) + float(body_norm.item())
+        diagnostics["neighbor_memory_norm_sum"] = diagnostics.get("neighbor_memory_norm_sum", 0.0) + float(neighbor_norm.item())
+        diagnostics["cross_doc_to_body_ratio_sum"] = diagnostics.get("cross_doc_to_body_ratio_sum", 0.0) + float(ratio.item())
+        diagnostics["applied_layer_count"] = diagnostics.get("applied_layer_count", 0) + 1
+
     updated_attn_output = attn_output.clone()
     updated_attn_output[:, :-num_compression_tokens, :] = (
         updated_attn_output[:, :-num_compression_tokens, :] + cross_doc_output
