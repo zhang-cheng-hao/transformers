@@ -26,7 +26,20 @@ def compute_block_sparse_injection(
 
     query_flat = query_states.transpose(1, 2).contiguous().view(bsz * q_len, num_heads, hidden_dim)
     grouped_queries = query_flat.index_select(0, query_token_indices)
-    detail_output = grouped_queries.new_zeros(grouped_queries.shape)
+    num_groups = query_group_offsets.numel() - 1
+
+    group_starts = query_group_offsets[:-1]
+    group_lengths = query_group_offsets[1:] - query_group_offsets[:-1]
+    max_group_length = int(group_lengths.max().item())
+    group_rel = torch.arange(max_group_length, device=query_states.device)
+    group_mask = group_rel.unsqueeze(0) < group_lengths.unsqueeze(1)
+    group_positions = group_starts.unsqueeze(1) + group_rel.unsqueeze(0)
+    safe_group_positions = group_positions.masked_fill(~group_mask, 0)
+
+    grouped_queries_padded = grouped_queries.index_select(0, safe_group_positions.reshape(-1)).view(
+        num_groups, max_group_length, num_heads, hidden_dim
+    )
+    grouped_queries_padded = grouped_queries_padded * group_mask[:, :, None, None].to(grouped_queries.dtype)
 
     pair_group_ids = block_sparse_metadata["pair_query_group_ids"].to(query_states.device)
     pair_seq_ids = block_sparse_metadata["pair_seq_ids"].to(query_states.device)
@@ -34,34 +47,40 @@ def compute_block_sparse_injection(
     pair_kv_ends = block_sparse_metadata["pair_kv_ends"].to(query_states.device)
     pair_detail_weights = block_sparse_metadata["pair_detail_weights"].to(query_states.device, dtype=grouped_queries.dtype)
 
-    for pair_idx in range(pair_group_ids.numel()):
-        group_id = pair_group_ids[pair_idx].item()
-        group_start = query_group_offsets[group_id].item()
-        group_end = query_group_offsets[group_id + 1].item()
-        if group_end <= group_start:
-            continue
+    detail_output = grouped_queries.new_zeros(grouped_queries.shape)
+    if pair_group_ids.numel() > 0:
+        pair_queries = grouped_queries_padded.index_select(0, pair_group_ids).permute(0, 2, 1, 3).contiguous()
 
-        seq_id = pair_seq_ids[pair_idx].item()
-        kv_start = pair_kv_starts[pair_idx].item()
-        kv_end = pair_kv_ends[pair_idx].item()
-        if kv_end <= kv_start:
-            continue
+        kv_lengths = pair_kv_ends - pair_kv_starts
+        max_kv_length = int(kv_lengths.max().item())
+        kv_rel = torch.arange(max_kv_length, device=query_states.device)
+        kv_mask = kv_rel.unsqueeze(0) < kv_lengths.unsqueeze(1)
+        kv_positions = pair_kv_starts.unsqueeze(1) + kv_rel.unsqueeze(0)
+        safe_kv_positions = kv_positions.masked_fill(~kv_mask, 0)
 
-        query_group = grouped_queries[group_start:group_end].permute(1, 0, 2)
-        key_span = cached_keys[seq_id, :, kv_start:kv_end, :]
-        value_span = cached_values[seq_id, :, kv_start:kv_end, :]
+        cached_keys_seq_first = cached_keys.permute(0, 2, 1, 3).contiguous()
+        cached_values_seq_first = cached_values.permute(0, 2, 1, 3).contiguous()
+        pair_keys = cached_keys_seq_first[pair_seq_ids[:, None], safe_kv_positions].permute(0, 2, 1, 3).contiguous()
+        pair_values = cached_values_seq_first[pair_seq_ids[:, None], safe_kv_positions].permute(0, 2, 1, 3).contiguous()
 
-        attn_scores = torch.matmul(query_group, key_span.transpose(-2, -1)) / math.sqrt(head_dim)
-        attn_probs = nn.functional.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_group.dtype)
+        attn_scores = torch.matmul(pair_queries, pair_keys.transpose(-2, -1)) / math.sqrt(head_dim)
+        min_dtype = torch.finfo(attn_scores.dtype).min
+        attn_scores = attn_scores.masked_fill(~kv_mask[:, None, None, :], min_dtype)
+        attn_probs = nn.functional.softmax(attn_scores, dim=-1, dtype=torch.float32).to(pair_queries.dtype)
         attn_probs = nn.functional.dropout(attn_probs, p=attention_dropout, training=training)
-        pair_ctx = torch.matmul(attn_probs, value_span)
+        pair_ctx = torch.matmul(attn_probs, pair_values)
 
         if not disable_v_norm:
-            value_norm = torch.norm(value_span, p=2, dim=-1, keepdim=True)
+            value_norm = torch.norm(pair_values, p=2, dim=-1, keepdim=True)
             weighted_value_norm = torch.matmul(attn_probs, value_norm)
             pair_ctx = pair_ctx / (weighted_value_norm + 1e-6)
 
-        detail_output[group_start:group_end] += pair_detail_weights[pair_idx] * pair_ctx.permute(1, 0, 2)
+        weighted_pair_ctx = pair_ctx * pair_detail_weights[:, None, None, None]
+        weighted_pair_ctx = weighted_pair_ctx.permute(0, 2, 1, 3).contiguous()
+
+        group_detail = grouped_queries.new_zeros((num_groups, max_group_length, num_heads, hidden_dim))
+        group_detail.index_add_(0, pair_group_ids, weighted_pair_ctx)
+        detail_output = group_detail[group_mask]
 
     doc_alpha = block_sparse_metadata["doc_alpha"].to(query_states.device, dtype=grouped_queries.dtype)
     if doc_alpha.numel() > 0:
@@ -71,13 +90,7 @@ def compute_block_sparse_injection(
             original_attention_mask=original_attention_mask,
         ).to(grouped_queries.dtype)
         group_doc_ctx = torch.einsum("gb,bhd->ghd", doc_alpha, doc_values)
-        summary_output = grouped_queries.new_zeros(grouped_queries.shape)
-        for group_id in range(query_group_offsets.numel() - 1):
-            group_start = query_group_offsets[group_id].item()
-            group_end = query_group_offsets[group_id + 1].item()
-            if group_end <= group_start:
-                continue
-            summary_output[group_start:group_end] = group_doc_ctx[group_id].unsqueeze(0)
+        summary_output = group_doc_ctx[:, None, :, :].expand(-1, max_group_length, -1, -1)[group_mask]
     else:
         summary_output = grouped_queries.new_zeros(grouped_queries.shape)
 
