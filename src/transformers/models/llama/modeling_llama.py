@@ -38,6 +38,7 @@ from ...modeling_outputs import (
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
+from ...modeling_block_sparse_utils import compute_block_sparse_injection
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -462,7 +463,25 @@ class LlamaAttention(nn.Module):
         # shape: (B, n_heads, L, head_dim)
         attn_output = torch.matmul(attn_weights, value_states)        
         
-        if inbatch_attn is not None and cached_key_value is not None:
+        block_sparse_metadata = kwargs.get("block_sparse_metadata")
+        if block_sparse_metadata is not None and cached_key_value is not None:
+            cached_keys = cached_key_value[0]
+            cached_values = cached_key_value[1]
+            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+            sparse_output = compute_block_sparse_injection(
+                query_states=query_states,
+                cached_keys=cached_keys,
+                cached_values=cached_values,
+                block_sparse_metadata=block_sparse_metadata,
+                head_dim=self.head_dim,
+                attention_dropout=self.attention_dropout,
+                training=self.training,
+                disable_v_norm=("disable_v_norm" in kwargs and kwargs["disable_v_norm"]),
+                original_attention_mask=original_attention_mask,
+            )
+            attn_output = attn_output + sparse_output
+        elif inbatch_attn is not None and cached_key_value is not None:
             # Debugging: Log shapes to diagnose rank disagreement
             # if self.layer_idx == 0:
             #     if torch.distributed.is_initialized():
@@ -662,7 +681,26 @@ class LlamaFlashAttention2(LlamaAttention):
             is_causal=self.is_causal,
         )
 
-        if inbatch_attn is not None and cached_key_value is not None:
+        block_sparse_metadata = kwargs.get("block_sparse_metadata")
+        if block_sparse_metadata is not None and cached_key_value is not None:
+            query_states = query_states.transpose(1, 2)
+            cached_keys = cached_key_value[0]
+            cached_values = cached_key_value[1]
+            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+            sparse_output = compute_block_sparse_injection(
+                query_states=query_states,
+                cached_keys=cached_keys,
+                cached_values=cached_values,
+                block_sparse_metadata=block_sparse_metadata,
+                head_dim=self.head_dim,
+                attention_dropout=self.attention_dropout,
+                training=self.training,
+                disable_v_norm=("disable_v_norm" in kwargs and kwargs["disable_v_norm"]),
+                original_attention_mask=original_attention_mask,
+            )
+            attn_output = attn_output + sparse_output.transpose(1, 2)
+        elif inbatch_attn is not None and cached_key_value is not None:
             # transpose back
             query_states = query_states.transpose(1, 2)
             
@@ -886,7 +924,25 @@ class LlamaSdpaAttention(LlamaAttention):
             is_causal=is_causal,
         )
 
-        if inbatch_attn is not None and cached_key_value is not None:            
+        block_sparse_metadata = kwargs.get("block_sparse_metadata")
+        if block_sparse_metadata is not None and cached_key_value is not None:
+            cached_keys = cached_key_value[0]
+            cached_values = cached_key_value[1]
+            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+            sparse_output = compute_block_sparse_injection(
+                query_states=query_states,
+                cached_keys=cached_keys,
+                cached_values=cached_values,
+                block_sparse_metadata=block_sparse_metadata,
+                head_dim=self.head_dim,
+                attention_dropout=self.attention_dropout,
+                training=self.training,
+                disable_v_norm=("disable_v_norm" in kwargs and kwargs["disable_v_norm"]),
+                original_attention_mask=original_attention_mask,
+            )
+            attn_output = attn_output + sparse_output
+        elif inbatch_attn is not None and cached_key_value is not None:
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
@@ -1313,6 +1369,7 @@ class LlamaModel(LlamaPreTrainedModel):
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         inbatch_attn_layers = kwargs.pop("inbatch_attn_layers", None)  # e.g. {0, 4, 8, 12, ...} or None = all
+        block_sparse_metadata = kwargs.get("block_sparse_metadata")
         # Caller may pass original_attention_mask via kwargs; pop it once to avoid duplicate kwargs at decoder_layer.
         inbatch_original_attention_mask = kwargs.pop("original_attention_mask", attention_mask)
         output_hidden_states = (
@@ -1375,7 +1432,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             _use_inbatch = (
-                inbatch_attn is not None
+                (inbatch_attn is not None or block_sparse_metadata is not None)
                 and cached_key_values is not None
                 and (inbatch_attn_layers is None or layer_idx in inbatch_attn_layers)
             )
