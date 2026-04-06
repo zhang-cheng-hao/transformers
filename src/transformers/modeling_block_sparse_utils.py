@@ -41,60 +41,46 @@ def compute_block_sparse_injection(
     )
     grouped_queries_padded = grouped_queries_padded * group_mask[:, :, None, None].to(grouped_queries.dtype)
 
-    pair_group_ids = block_sparse_metadata["pair_query_group_ids"].to(query_states.device)
-    pair_seq_ids = block_sparse_metadata["pair_seq_ids"].to(query_states.device)
-    pair_kv_starts = block_sparse_metadata["pair_kv_starts"].to(query_states.device)
-    pair_kv_ends = block_sparse_metadata["pair_kv_ends"].to(query_states.device)
-    pair_detail_weights = block_sparse_metadata["pair_detail_weights"].to(query_states.device, dtype=grouped_queries.dtype)
+    pair_cache = _gather_pair_cache(
+        cached_keys=cached_keys,
+        cached_values=cached_values,
+        block_sparse_metadata=block_sparse_metadata,
+        device=query_states.device,
+    )
+    d2d_read = _d2d_read(
+        grouped_queries=grouped_queries,
+        group_mask=group_mask,
+        cached_values=cached_values,
+        block_sparse_metadata=block_sparse_metadata,
+        original_attention_mask=original_attention_mask,
+    )
+    b2b_read = _b2b_read(
+        grouped_queries=grouped_queries,
+        group_mask=group_mask,
+        num_groups=num_groups,
+        max_group_length=max_group_length,
+        pair_cache=pair_cache,
+        block_sparse_metadata=block_sparse_metadata,
+    )
+    t2t_read = _t2t_read(
+        grouped_queries=grouped_queries,
+        grouped_queries_padded=grouped_queries_padded,
+        group_mask=group_mask,
+        num_groups=num_groups,
+        max_group_length=max_group_length,
+        pair_cache=pair_cache,
+        block_sparse_metadata=block_sparse_metadata,
+        head_dim=head_dim,
+        attention_dropout=attention_dropout,
+        training=training,
+        disable_v_norm=disable_v_norm,
+    )
 
-    detail_output = grouped_queries.new_zeros(grouped_queries.shape)
-    if pair_group_ids.numel() > 0:
-        pair_queries = grouped_queries_padded.index_select(0, pair_group_ids).permute(0, 2, 1, 3).contiguous()
-
-        kv_lengths = pair_kv_ends - pair_kv_starts
-        max_kv_length = int(kv_lengths.max().item())
-        kv_rel = torch.arange(max_kv_length, device=query_states.device)
-        kv_mask = kv_rel.unsqueeze(0) < kv_lengths.unsqueeze(1)
-        kv_positions = pair_kv_starts.unsqueeze(1) + kv_rel.unsqueeze(0)
-        safe_kv_positions = kv_positions.masked_fill(~kv_mask, 0)
-
-        cached_keys_seq_first = cached_keys.permute(0, 2, 1, 3).contiguous()
-        cached_values_seq_first = cached_values.permute(0, 2, 1, 3).contiguous()
-        pair_keys = cached_keys_seq_first[pair_seq_ids[:, None], safe_kv_positions].permute(0, 2, 1, 3).contiguous()
-        pair_values = cached_values_seq_first[pair_seq_ids[:, None], safe_kv_positions].permute(0, 2, 1, 3).contiguous()
-
-        attn_scores = torch.matmul(pair_queries, pair_keys.transpose(-2, -1)) / math.sqrt(head_dim)
-        min_dtype = torch.finfo(attn_scores.dtype).min
-        attn_scores = attn_scores.masked_fill(~kv_mask[:, None, None, :], min_dtype)
-        attn_probs = nn.functional.softmax(attn_scores, dim=-1, dtype=torch.float32).to(pair_queries.dtype)
-        attn_probs = nn.functional.dropout(attn_probs, p=attention_dropout, training=training)
-        pair_ctx = torch.matmul(attn_probs, pair_values)
-
-        if not disable_v_norm:
-            value_norm = torch.norm(pair_values, p=2, dim=-1, keepdim=True)
-            weighted_value_norm = torch.matmul(attn_probs, value_norm)
-            pair_ctx = pair_ctx / (weighted_value_norm + 1e-6)
-
-        weighted_pair_ctx = pair_ctx * pair_detail_weights[:, None, None, None]
-        weighted_pair_ctx = weighted_pair_ctx.permute(0, 2, 1, 3).contiguous()
-
-        group_detail = grouped_queries.new_zeros((num_groups, max_group_length, num_heads, hidden_dim))
-        group_detail.index_add_(0, pair_group_ids, weighted_pair_ctx)
-        detail_output = group_detail[group_mask]
-
-    doc_alpha = block_sparse_metadata["doc_alpha"].to(query_states.device, dtype=grouped_queries.dtype)
-    if doc_alpha.numel() > 0:
-        doc_values = _doc_memory_values(
-            cached_values=cached_values,
-            block_sparse_metadata=block_sparse_metadata,
-            original_attention_mask=original_attention_mask,
-        ).to(grouped_queries.dtype)
-        group_doc_ctx = torch.einsum("gb,bhd->ghd", doc_alpha, doc_values)
-        summary_output = group_doc_ctx[:, None, :, :].expand(-1, max_group_length, -1, -1)[group_mask]
-    else:
-        summary_output = grouped_queries.new_zeros(grouped_queries.shape)
-
-    total_output = summary_output + float(block_sparse_metadata.get("detail_lambda", 1.0)) * detail_output
+    total_output = (
+        d2d_read
+        + b2b_read
+        + float(block_sparse_metadata.get("detail_lambda", 1.0)) * t2t_read
+    )
 
     scatter_flat = grouped_queries.new_zeros((bsz * q_len, num_heads, hidden_dim))
     scatter_flat.index_add_(0, query_token_indices, total_output)
@@ -106,6 +92,134 @@ def compute_block_sparse_injection(
         route_mask = routing_query_mask.unsqueeze(1).unsqueeze(-1).bool()
         scatter_output = scatter_output.masked_fill(route_mask, 0.0)
     return scatter_output
+
+
+def _d2d_read(
+    grouped_queries: torch.Tensor,
+    group_mask: torch.Tensor,
+    cached_values: torch.Tensor,
+    block_sparse_metadata: Dict[str, torch.Tensor],
+    original_attention_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    d2d_prob = block_sparse_metadata["d2d_prob"].to(grouped_queries.device, dtype=grouped_queries.dtype)
+    if d2d_prob.numel() == 0:
+        return grouped_queries.new_zeros(grouped_queries.shape)
+
+    doc_values = _doc_memory_values(
+        cached_values=cached_values,
+        block_sparse_metadata=block_sparse_metadata,
+        original_attention_mask=original_attention_mask,
+    ).to(grouped_queries.dtype)
+    group_doc_ctx = torch.einsum("gb,bhd->ghd", d2d_prob, doc_values)
+    return group_doc_ctx[:, None, :, :].expand(-1, group_mask.size(1), -1, -1)[group_mask]
+
+
+def _b2b_read(
+    grouped_queries: torch.Tensor,
+    group_mask: torch.Tensor,
+    num_groups: int,
+    max_group_length: int,
+    pair_cache: Optional[Dict[str, torch.Tensor]],
+    block_sparse_metadata: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    if pair_cache is None:
+        return grouped_queries.new_zeros(grouped_queries.shape)
+
+    route_prob = _route_prob(block_sparse_metadata, grouped_queries)
+    if route_prob.numel() == 0:
+        return grouped_queries.new_zeros(grouped_queries.shape)
+
+    kv_mask = pair_cache["kv_mask"][:, None, :, None].to(pair_cache["pair_values"].dtype)
+    kv_lengths = pair_cache["kv_lengths"].clamp(min=1).to(pair_cache["pair_values"].dtype)
+    block_summary = (pair_cache["pair_values"] * kv_mask).sum(dim=2) / kv_lengths[:, None, None]
+    weighted_block_summary = block_summary * route_prob[:, None, None]
+
+    group_block_ctx = grouped_queries.new_zeros((num_groups, grouped_queries.size(1), grouped_queries.size(2)))
+    group_block_ctx.index_add_(0, pair_cache["pair_group_ids"], weighted_block_summary)
+    return group_block_ctx[:, None, :, :].expand(-1, max_group_length, -1, -1)[group_mask]
+
+
+def _t2t_read(
+    grouped_queries: torch.Tensor,
+    grouped_queries_padded: torch.Tensor,
+    group_mask: torch.Tensor,
+    num_groups: int,
+    max_group_length: int,
+    pair_cache: Optional[Dict[str, torch.Tensor]],
+    block_sparse_metadata: Dict[str, torch.Tensor],
+    *,
+    head_dim: int,
+    attention_dropout: float,
+    training: bool,
+    disable_v_norm: bool,
+) -> torch.Tensor:
+    if pair_cache is None:
+        return grouped_queries.new_zeros(grouped_queries.shape)
+
+    route_prob = _route_prob(block_sparse_metadata, grouped_queries)
+    if route_prob.numel() == 0:
+        return grouped_queries.new_zeros(grouped_queries.shape)
+
+    pair_queries = grouped_queries_padded.index_select(0, pair_cache["pair_group_ids"]).permute(0, 2, 1, 3).contiguous()
+    attn_scores = torch.matmul(pair_queries, pair_cache["pair_keys"].transpose(-2, -1)) / math.sqrt(head_dim)
+    min_dtype = torch.finfo(attn_scores.dtype).min
+    attn_scores = attn_scores.masked_fill(~pair_cache["kv_mask"][:, None, None, :], min_dtype)
+    attn_probs = nn.functional.softmax(attn_scores, dim=-1, dtype=torch.float32).to(pair_queries.dtype)
+    attn_probs = nn.functional.dropout(attn_probs, p=attention_dropout, training=training)
+    pair_ctx = torch.matmul(attn_probs, pair_cache["pair_values"])
+
+    if not disable_v_norm:
+        value_norm = torch.norm(pair_cache["pair_values"], p=2, dim=-1, keepdim=True)
+        weighted_value_norm = torch.matmul(attn_probs, value_norm)
+        pair_ctx = pair_ctx / (weighted_value_norm + 1e-6)
+
+    weighted_pair_ctx = pair_ctx * route_prob[:, None, None, None]
+    weighted_pair_ctx = weighted_pair_ctx.permute(0, 2, 1, 3).contiguous()
+
+    group_detail = grouped_queries.new_zeros((num_groups, max_group_length, grouped_queries.size(1), grouped_queries.size(2)))
+    group_detail.index_add_(0, pair_cache["pair_group_ids"], weighted_pair_ctx)
+    return group_detail[group_mask]
+
+
+def _route_prob(
+    block_sparse_metadata: Dict[str, torch.Tensor],
+    grouped_queries: torch.Tensor,
+) -> torch.Tensor:
+    return block_sparse_metadata["route_prob"].to(grouped_queries.device, dtype=grouped_queries.dtype)
+
+
+def _gather_pair_cache(
+    cached_keys: torch.Tensor,
+    cached_values: torch.Tensor,
+    block_sparse_metadata: Dict[str, torch.Tensor],
+    device: torch.device,
+) -> Optional[Dict[str, torch.Tensor]]:
+    pair_group_ids = block_sparse_metadata["pair_query_group_ids"].to(device)
+    if pair_group_ids.numel() == 0:
+        return None
+
+    pair_seq_ids = block_sparse_metadata["pair_seq_ids"].to(device)
+    pair_kv_starts = block_sparse_metadata["pair_kv_starts"].to(device)
+    pair_kv_ends = block_sparse_metadata["pair_kv_ends"].to(device)
+
+    kv_lengths = pair_kv_ends - pair_kv_starts
+    max_kv_length = int(kv_lengths.max().item())
+    kv_rel = torch.arange(max_kv_length, device=device)
+    kv_mask = kv_rel.unsqueeze(0) < kv_lengths.unsqueeze(1)
+    kv_positions = pair_kv_starts.unsqueeze(1) + kv_rel.unsqueeze(0)
+    safe_kv_positions = kv_positions.masked_fill(~kv_mask, 0)
+
+    cached_keys_seq_first = cached_keys.permute(0, 2, 1, 3).contiguous()
+    cached_values_seq_first = cached_values.permute(0, 2, 1, 3).contiguous()
+    pair_keys = cached_keys_seq_first[pair_seq_ids[:, None], safe_kv_positions].permute(0, 2, 1, 3).contiguous()
+    pair_values = cached_values_seq_first[pair_seq_ids[:, None], safe_kv_positions].permute(0, 2, 1, 3).contiguous()
+    return {
+        "pair_group_ids": pair_group_ids,
+        "pair_keys": pair_keys,
+        "pair_values": pair_values,
+        "kv_lengths": kv_lengths,
+        "kv_mask": kv_mask,
+    }
 
 
 def _doc_memory_values(
