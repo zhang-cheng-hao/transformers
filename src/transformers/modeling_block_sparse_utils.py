@@ -15,6 +15,7 @@ def compute_block_sparse_injection(
     cached_keys: torch.Tensor,
     cached_values: torch.Tensor,
     block_sparse_metadata: Dict[str, torch.Tensor],
+    summary_query_states: torch.Tensor,
     *,
     head_dim: int,
     attention_dropout: float,
@@ -161,6 +162,7 @@ def _pair_reads(
     cached_values: torch.Tensor,
     pair_metadata: Optional[Dict[str, torch.Tensor]],
     route_prob: torch.Tensor,
+    summary_query_states: torch.Tensor,
     *,
     head_dim: int,
     attention_dropout: float,
@@ -210,14 +212,30 @@ def _pair_reads(
                 pair_kv_starts=pair_kv_starts,
                 pair_kv_ends=pair_kv_ends,
             )
-            weighted_block_summary = _packed_block_summary(
+            flat_summary_queries, cu_seqlens_summary_q = _build_flat_summary_queries(
+                summary_query_states=summary_query_states,
+                num_pairs=pair_group_ids.numel(),
+                dtype=grouped_queries.dtype,
+                device=grouped_queries.device,
+            )
+            flat_summary_ctx = _flash_varlen_t2t_read(
+                flat_queries=flat_summary_queries,
+                cu_seqlens_q=cu_seqlens_summary_q,
+                max_seqlen_q=1,
+                flat_keys=packed_kv["flat_keys"],
                 flat_values=packed_kv["flat_values"],
-                kv_lengths=packed_kv["kv_lengths"],
+                cu_seqlens_k=packed_kv["cu_seqlens_k"],
+                max_seqlen_k=packed_kv["max_seqlen_k"],
+                attention_dropout=attention_dropout,
+                training=training,
+                disable_v_norm=disable_v_norm,
+            )
+            weighted_block_summary = _summary_query_read(
+                summary_ctx=flat_summary_ctx,
                 route_prob=chunk_route_prob,
                 dtype=grouped_queries.dtype,
             )
             group_block_ctx.index_add_(0, pair_group_ids, weighted_block_summary)
-
             flat_ctx = _flash_varlen_t2t_read(
                 flat_queries=flat_queries,
                 cu_seqlens_q=cu_seqlens_q,
@@ -241,13 +259,28 @@ def _pair_reads(
                 pair_kv_starts=pair_kv_starts,
                 pair_kv_ends=pair_kv_ends,
             )
-
-            kv_mask = pair_cache["kv_mask"][:, None, :, None].to(pair_cache["pair_values"].dtype)
-            kv_lengths = pair_cache["kv_lengths"].clamp(min=1).to(pair_cache["pair_values"].dtype)
-            block_summary = (pair_cache["pair_values"] * kv_mask).sum(dim=2) / kv_lengths[:, None, None]
-            weighted_block_summary = block_summary * chunk_route_prob[:, None, None]
+            pair_summary_queries = _build_pair_summary_queries(
+                summary_query_states=summary_query_states,
+                num_pairs=pair_group_ids.numel(),
+                dtype=grouped_queries.dtype,
+                device=grouped_queries.device,
+            )
+            pair_summary_ctx = _pair_attention_dense(
+                pair_queries=pair_summary_queries,
+                pair_keys=pair_cache["pair_keys"],
+                pair_values=pair_cache["pair_values"],
+                kv_mask=pair_cache["kv_mask"],
+                head_dim=head_dim,
+                attention_dropout=attention_dropout,
+                training=training,
+                disable_v_norm=disable_v_norm,
+            ).squeeze(2)
+            weighted_block_summary = _summary_query_read(
+                summary_ctx=pair_summary_ctx,
+                route_prob=chunk_route_prob,
+                dtype=grouped_queries.dtype,
+            )
             group_block_ctx.index_add_(0, pair_group_ids, weighted_block_summary)
-
             pair_queries = grouped_queries_padded.index_select(0, pair_group_ids).permute(0, 2, 1, 3).contiguous()
             pair_ctx = _pair_attention_dense(
                 pair_queries=pair_queries,
@@ -441,20 +474,34 @@ def _gather_flat_kv_chunk(
     }
 
 
-def _packed_block_summary(
-    flat_values: torch.Tensor,
-    kv_lengths: torch.Tensor,
+def _build_pair_summary_queries(
+    summary_query_states: torch.Tensor,
+    num_pairs: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    summary_query = summary_query_states.to(device=device, dtype=dtype)
+    return summary_query.unsqueeze(0).unsqueeze(2).expand(num_pairs, -1, 1, -1).contiguous()
+
+
+def _build_flat_summary_queries(
+    summary_query_states: torch.Tensor,
+    num_pairs: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    summary_query = summary_query_states.to(device=device, dtype=dtype)
+    flat_queries = summary_query.unsqueeze(0).expand(num_pairs, -1, -1).contiguous()
+    cu_seqlens_q = torch.arange(num_pairs + 1, device=device, dtype=torch.int32)
+    return flat_queries, cu_seqlens_q
+
+
+def _summary_query_read(
+    summary_ctx: torch.Tensor,
     route_prob: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    pair_ids = torch.repeat_interleave(
-        torch.arange(kv_lengths.size(0), device=flat_values.device, dtype=torch.long),
-        kv_lengths.to(torch.long),
-    )
-    block_summary = flat_values.new_zeros((kv_lengths.size(0), flat_values.size(1), flat_values.size(2)))
-    block_summary.index_add_(0, pair_ids, flat_values)
-    block_summary = block_summary / kv_lengths.clamp(min=1).to(flat_values.dtype)[:, None, None]
-    return block_summary.to(dtype) * route_prob[:, None, None].to(dtype)
+    return summary_ctx.to(dtype) * route_prob[:, None, None].to(dtype)
 
 
 def _flash_varlen_t2t_read(

@@ -378,6 +378,8 @@ class LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.block_summary_query = nn.Parameter(torch.empty(self.num_heads, self.head_dim))
+        nn.init.normal_(self.block_summary_query, mean=0.0, std=0.02)
 
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -474,6 +476,7 @@ class LlamaAttention(nn.Module):
                 cached_keys=cached_keys,
                 cached_values=cached_values,
                 block_sparse_metadata=block_sparse_metadata,
+                summary_query_states=self.block_summary_query,
                 head_dim=self.head_dim,
                 attention_dropout=self.attention_dropout,
                 training=self.training,
@@ -693,6 +696,7 @@ class LlamaFlashAttention2(LlamaAttention):
                 cached_keys=cached_keys,
                 cached_values=cached_values,
                 block_sparse_metadata=block_sparse_metadata,
+                summary_query_states=self.block_summary_query,
                 head_dim=self.head_dim,
                 attention_dropout=self.attention_dropout,
                 training=self.training,
@@ -935,6 +939,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 cached_keys=cached_keys,
                 cached_values=cached_values,
                 block_sparse_metadata=block_sparse_metadata,
+                summary_query_states=self.block_summary_query,
                 head_dim=self.head_dim,
                 attention_dropout=self.attention_dropout,
                 training=self.training,

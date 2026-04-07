@@ -326,6 +326,8 @@ class Qwen2Attention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.block_summary_query = nn.Parameter(torch.empty(self.num_heads, self.head_dim))
+        nn.init.normal_(self.block_summary_query, mean=0.0, std=0.02)
 
         self.rotary_emb = Qwen2RotaryEmbedding(config=self.config)
 
@@ -395,6 +397,7 @@ class Qwen2Attention(nn.Module):
                 cached_keys=cached_keys,
                 cached_values=cached_values,
                 block_sparse_metadata=block_sparse_metadata,
+                summary_query_states=self.block_summary_query,
                 head_dim=self.head_dim,
                 attention_dropout=self.attention_dropout,
                 training=self.training,
@@ -714,6 +717,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 cached_keys=cached_keys,
                 cached_values=cached_values,
                 block_sparse_metadata=block_sparse_metadata,
+                summary_query_states=self.block_summary_query,
                 head_dim=self.head_dim,
                 attention_dropout=self.attention_dropout,
                 training=self.training,
