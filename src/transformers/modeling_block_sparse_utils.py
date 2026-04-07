@@ -63,6 +63,7 @@ def compute_block_sparse_injection(
         cached_values=cached_values,
         pair_metadata=pair_metadata,
         route_prob=route_prob,
+        summary_query_states=summary_query_states,
         head_dim=head_dim,
         attention_dropout=attention_dropout,
         training=training,
