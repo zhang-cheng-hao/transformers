@@ -445,8 +445,11 @@ class LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-        self.block_summary_query = nn.Parameter(torch.empty(self.num_heads, self.head_dim))
-        nn.init.normal_(self.block_summary_query, mean=0.0, std=0.02)
+        if getattr(config, "use_block_sparse_routing", False):
+            self.block_summary_query = nn.Parameter(torch.empty(self.num_heads, self.head_dim))
+            nn.init.normal_(self.block_summary_query, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("block_summary_query", None)
 
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -538,6 +541,11 @@ class LlamaAttention(nn.Module):
             cached_values = cached_key_value[1]
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+            if self.block_summary_query is None:
+                raise ValueError(
+                    "block_sparse_metadata was provided but block_summary_query is not initialized; "
+                    "load the model with use_block_sparse_routing=True"
+                )
             sparse_output = compute_block_sparse_injection(
                 query_states=query_states,
                 cached_keys=cached_keys,
@@ -770,6 +778,11 @@ class LlamaFlashAttention2(LlamaAttention):
             cached_values = cached_key_value[1]
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+            if self.block_summary_query is None:
+                raise ValueError(
+                    "block_sparse_metadata was provided but block_summary_query is not initialized; "
+                    "load the model with use_block_sparse_routing=True"
+                )
             sparse_output = compute_block_sparse_injection(
                 query_states=query_states,
                 cached_keys=cached_keys,
@@ -1025,6 +1038,11 @@ class LlamaSdpaAttention(LlamaAttention):
             cached_values = cached_key_value[1]
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+            if self.block_summary_query is None:
+                raise ValueError(
+                    "block_sparse_metadata was provided but block_summary_query is not initialized; "
+                    "load the model with use_block_sparse_routing=True"
+                )
             sparse_output = compute_block_sparse_injection(
                 query_states=query_states,
                 cached_keys=cached_keys,
