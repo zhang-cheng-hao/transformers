@@ -117,6 +117,72 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
     return causal_mask
 
 
+def _compute_chorus_route_bias_injection(
+    *,
+    query_states: torch.Tensor,
+    cached_key_value,
+    num_key_value_groups: int,
+    head_dim: int,
+    attention_dropout: float,
+    training: bool,
+    kwargs,
+):
+    seq_route_probs = kwargs.get("seq_route_probs")
+    ch_route_probs = kwargs.get("ch_route_probs")
+    memory_source_index = kwargs.get("memory_source_index")
+    memory_channel_index = kwargs.get("memory_channel_index")
+    if (
+        seq_route_probs is None
+        or ch_route_probs is None
+        or memory_source_index is None
+        or memory_channel_index is None
+        or cached_key_value is None
+    ):
+        return None
+
+    cached_keys = repeat_kv(cached_key_value[0], num_key_value_groups)
+    cached_values = repeat_kv(cached_key_value[1], num_key_value_groups)
+
+    device = query_states.device
+    dtype = query_states.dtype
+    batch_size, num_heads, _, _ = query_states.shape
+    num_channels = cached_keys.shape[-2]
+
+    seq_route_probs = seq_route_probs.to(device=device, dtype=dtype)
+    ch_route_probs = ch_route_probs.to(device=device, dtype=dtype)
+    memory_source_index = memory_source_index.to(device=device, dtype=torch.long)
+    memory_channel_index = memory_channel_index.to(device=device, dtype=torch.long)
+
+    source_index = memory_source_index[:, None, :].expand(batch_size, num_heads, -1)
+    channel_index = memory_channel_index[:, None, :].expand(batch_size, num_heads, -1)
+    head_index = torch.arange(num_heads, device=device, dtype=torch.long).view(1, num_heads, 1).expand_as(source_index)
+
+    gathered_keys = cached_keys[source_index, head_index, channel_index]
+    gathered_values = cached_values[source_index, head_index, channel_index]
+
+    content_logits = torch.matmul(query_states, gathered_keys.transpose(-2, -1)) / math.sqrt(head_dim)
+    seq_bias = torch.gather(seq_route_probs, 1, memory_source_index)
+    flat_channel_index = memory_source_index * num_channels + memory_channel_index
+    ch_bias = torch.gather(ch_route_probs.view(batch_size, -1), 1, flat_channel_index)
+    route_bias = torch.log(seq_bias.clamp_min(1e-12)) + torch.log(ch_bias.clamp_min(1e-12))
+
+    logits = content_logits + route_bias[:, None, None, :].to(dtype)
+    attn_probs = nn.functional.softmax(logits, dim=-1, dtype=torch.float32).to(dtype)
+    attn_probs = nn.functional.dropout(attn_probs, p=attention_dropout, training=training)
+    route_output = torch.matmul(attn_probs, gathered_values)
+
+    if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
+        value_norm = torch.norm(gathered_values, p=2, dim=-1, keepdim=True)
+        weighted_value_norm = torch.matmul(attn_probs, value_norm)
+        route_output = route_output / (weighted_value_norm + 1e-6)
+
+    if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
+        route_output = route_output.masked_fill(kwargs["first_half_mask"][:, None, :, None].bool(), 0.0)
+    if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
+        route_output = route_output.masked_fill(kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool(), 0.0)
+    return route_output
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2
 class Qwen2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -405,38 +471,50 @@ class Qwen2Attention(nn.Module):
                 original_attention_mask=original_attention_mask,
             )
             attn_output = attn_output + sparse_output
-        elif inbatch_attn is not None and cached_key_value is not None:
-            cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
-            cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
-            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
-            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+        else:
+            route_bias_output = _compute_chorus_route_bias_injection(
+                query_states=query_states,
+                cached_key_value=cached_key_value,
+                num_key_value_groups=self.num_key_value_groups,
+                head_dim=self.head_dim,
+                attention_dropout=self.attention_dropout,
+                training=self.training,
+                kwargs=kwargs,
+            )
+            if route_bias_output is not None:
+                attn_output = attn_output + route_bias_output
+            elif inbatch_attn is not None and cached_key_value is not None:
+                cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
+                cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
+                cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+                cached_values = repeat_kv(cached_values, self.num_key_value_groups)
 
-            cached_key_expanded = cached_keys.unsqueeze(0)
-            query_states_expanded = query_states.unsqueeze(1)
-            inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if original_attention_mask is not None:
-                min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                padding_mask = original_attention_mask == 0
-                original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
-                    padding_mask, min_dtype
-                )                
-                # add original casual mask
-                inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
-            # B (query) x B (key) x num_heads x seq_len x head_dim
-            inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
-            # 1 x B x num_heads x seq_len x head_dim
-            catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
-            # B x B x num_heads x seq_len x head_dim
-            inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+                cached_key_expanded = cached_keys.unsqueeze(0)
+                query_states_expanded = query_states.unsqueeze(1)
+                inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                if original_attention_mask is not None:
+                    min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                    padding_mask = original_attention_mask == 0
+                    original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                        padding_mask, min_dtype
+                    )                
+                    # add original casual mask
+                    inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                # B (query) x B (key) x num_heads x seq_len x head_dim
+                inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+                # 1 x B x num_heads x seq_len x head_dim
+                catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
+                # B x B x num_heads x seq_len x head_dim
+                inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
             
-            inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
-            inbatch_attn_output = inbatch_attn_output.sum(dim=1)
+                inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
+                inbatch_attn_output = inbatch_attn_output.sum(dim=1)
 
-            if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
-                route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
-                inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
-            attn_output = attn_output + inbatch_attn_output
+                if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
+                    route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
+                    inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
+                attn_output = attn_output + inbatch_attn_output
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -725,91 +803,103 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 original_attention_mask=original_attention_mask,
             )
             attn_output = attn_output + sparse_output
-        elif inbatch_attn is not None and cached_key_value is not None:            
-            cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
-            cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
-            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
-            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+        else:
+            route_bias_output = _compute_chorus_route_bias_injection(
+                query_states=query_states,
+                cached_key_value=cached_key_value,
+                num_key_value_groups=self.num_key_value_groups,
+                head_dim=self.head_dim,
+                attention_dropout=self.attention_dropout,
+                training=self.training,
+                kwargs=kwargs,
+            )
+            if route_bias_output is not None:
+                attn_output = attn_output + route_bias_output
+            elif inbatch_attn is not None and cached_key_value is not None:            
+                cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
+                cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
+                cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+                cached_values = repeat_kv(cached_values, self.num_key_value_groups)
 
-            if "is_one_hot" in kwargs and kwargs["is_one_hot"]:
-                sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
-                sel_keys = cached_keys[sel_idx] # [B, n_head, L, d]
-                sel_values = cached_values[sel_idx] # [B, n_head, L, d]
+                if "is_one_hot" in kwargs and kwargs["is_one_hot"]:
+                    sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
+                    sel_keys = cached_keys[sel_idx] # [B, n_head, L, d]
+                    sel_values = cached_values[sel_idx] # [B, n_head, L, d]
 
-                if original_attention_mask is not None:
-                    sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
+                    if original_attention_mask is not None:
+                        sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
 
-                inbatch_attn_weights = torch.matmul(
-                    query_states,                               # [B, n_head, L_q, d]
-                    sel_keys.transpose(-2, -1)                  # [B, n_head, d, L_k]
-                ) / math.sqrt(self.head_dim)
+                    inbatch_attn_weights = torch.matmul(
+                        query_states,                               # [B, n_head, L_q, d]
+                        sel_keys.transpose(-2, -1)                  # [B, n_head, d, L_k]
+                    ) / math.sqrt(self.head_dim)
     
-                if original_attention_mask is not None:
-                    min_val = torch.finfo(inbatch_attn_weights.dtype).min
-                    key_mask = sel_pad_mask[:, None, None, :]           # [B,1,1,L_k]
-                    key_mask = key_mask.to(inbatch_attn_weights.dtype).masked_fill(key_mask == 0, min_val)
-                    inbatch_attn_weights += key_mask
+                    if original_attention_mask is not None:
+                        min_val = torch.finfo(inbatch_attn_weights.dtype).min
+                        key_mask = sel_pad_mask[:, None, None, :]           # [B,1,1,L_k]
+                        key_mask = key_mask.to(inbatch_attn_weights.dtype).masked_fill(key_mask == 0, min_val)
+                        inbatch_attn_weights += key_mask
 
-                inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+                    inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                    inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
 
-                inbatch_attn_output = torch.matmul(inbatch_attn_weights, sel_values)
+                    inbatch_attn_output = torch.matmul(inbatch_attn_weights, sel_values)
 
-                if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
-                    v_norm  = torch.norm(sel_values, p=2, dim=-1, keepdim=True)          # [B,n_head,L_k,1]
-                    wv_norm = torch.matmul(inbatch_attn_weights, v_norm)                 # [B,n_head,L_q,1]
-                    eps = 1e-6
-                    inbatch_attn_output = inbatch_attn_output / (wv_norm + eps)
+                    if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
+                        v_norm  = torch.norm(sel_values, p=2, dim=-1, keepdim=True)          # [B,n_head,L_k,1]
+                        wv_norm = torch.matmul(inbatch_attn_weights, v_norm)                 # [B,n_head,L_q,1]
+                        eps = 1e-6
+                        inbatch_attn_output = inbatch_attn_output / (wv_norm + eps)
 
-            else:
-                # 1 x B x num_heads x seq_len x head_dim
-                cached_key_expanded = cached_keys.unsqueeze(0)
-                # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
-                query_states_expanded = query_states.unsqueeze(1)
-                # B (query) x B (key) x num_heads x seq_len x seq_len
-                inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                else:
+                    # 1 x B x num_heads x seq_len x head_dim
+                    cached_key_expanded = cached_keys.unsqueeze(0)
+                    # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
+                    query_states_expanded = query_states.unsqueeze(1)
+                    # B (query) x B (key) x num_heads x seq_len x seq_len
+                    inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-                if original_attention_mask is not None:
-                    # origianl_attention_mask is for key, instead of query
-                    # as for query, it is already covered by the causal mask
-                    min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                    # original_attention_mask = original_attention_mask[None, :, None, None, :]
-                    padding_mask = original_attention_mask == 0
-                    original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
-                        padding_mask, min_dtype
-                    )                
-                    # add original casual mask
-                    inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+                    if original_attention_mask is not None:
+                        # origianl_attention_mask is for key, instead of query
+                        # as for query, it is already covered by the causal mask
+                        min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                        # original_attention_mask = original_attention_mask[None, :, None, None, :]
+                        padding_mask = original_attention_mask == 0
+                        original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                            padding_mask, min_dtype
+                        )                
+                        # add original casual mask
+                        inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
-                # B (query) x B (key) x num_heads x seq_len x seq_len
-                inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+                    # B (query) x B (key) x num_heads x seq_len x seq_len
+                    inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                    inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
                 
-                # 1 x B x num_heads x seq_len x head_dim
-                catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
-                # B x B x num_heads x seq_len x head_dim
-                inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+                    # 1 x B x num_heads x seq_len x head_dim
+                    catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
+                    # B x B x num_heads x seq_len x head_dim
+                    inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
                 
-                value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
-                # weighted_value_norm: B x B x (num_head) x seq_len x 1
-                weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
+                    value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
+                    # weighted_value_norm: B x B x (num_head) x seq_len x 1
+                    weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
                 
-                # if "head_normalization" in kwargs and kwargs["head_normalization"]:
-                #     weighted_value_norm = weighted_value_norm.sum(dim=2, keepdim=True)
+                    # if "head_normalization" in kwargs and kwargs["head_normalization"]:
+                    #     weighted_value_norm = weighted_value_norm.sum(dim=2, keepdim=True)
                             
-                epsilon = 1e-6  # Small constant for numerical stability
-                inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
+                    epsilon = 1e-6  # Small constant for numerical stability
+                    inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
 
-                # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
-                # inbatch_attn_output : B x num_heads x seq_len x head_dim
-                inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
-                inbatch_attn_output = inbatch_attn_output.sum(dim=1)    
+                    # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
+                    # inbatch_attn_output : B x num_heads x seq_len x head_dim
+                    inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
+                    inbatch_attn_output = inbatch_attn_output.sum(dim=1)    
             
-            # TODO: currently just add - we need to think more about other combinations - learnable parameter
-            if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
-                route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
-                inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
-            attn_output = attn_output + inbatch_attn_output
+                # TODO: currently just add - we need to think more about other combinations - learnable parameter
+                if "routing_query_mask" in kwargs and kwargs["routing_query_mask"] is not None:
+                    route_mask = kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool()
+                    inbatch_attn_output = inbatch_attn_output.masked_fill(route_mask, 0.0)
+                attn_output = attn_output + inbatch_attn_output
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
