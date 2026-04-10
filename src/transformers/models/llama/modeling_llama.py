@@ -84,7 +84,7 @@ def build_inbatch_attn_layers(
 
 
 
-def _compute_chorus_route_bias_injection(
+def _compute_chorus_routed_injection(
     *,
     query_states: torch.Tensor,
     cached_key_value,
@@ -113,7 +113,16 @@ def _compute_chorus_route_bias_injection(
     device = query_states.device
     dtype = query_states.dtype
     batch_size, num_heads, _, _ = query_states.shape
+    memory_width = memory_source_index.size(1)
+    if memory_width == 0:
+        return torch.zeros_like(query_states)
     num_channels = cached_keys.shape[-2]
+    if num_channels <= 0 or (memory_width % num_channels) != 0:
+        raise ValueError(
+            f"Expected memory width to be a positive multiple of num_channels, "
+            f"got memory_width={memory_width}, num_channels={num_channels}"
+        )
+    num_sources = memory_width // num_channels
 
     seq_route_probs = seq_route_probs.to(device=device, dtype=dtype)
     ch_route_probs = ch_route_probs.to(device=device, dtype=dtype)
@@ -127,21 +136,39 @@ def _compute_chorus_route_bias_injection(
     gathered_keys = cached_keys[source_index, head_index, channel_index]
     gathered_values = cached_values[source_index, head_index, channel_index]
 
-    content_logits = torch.matmul(query_states, gathered_keys.transpose(-2, -1)) / math.sqrt(head_dim)
-    seq_bias = torch.gather(seq_route_probs, 1, memory_source_index)
-    flat_channel_index = memory_source_index * num_channels + memory_channel_index
-    ch_bias = torch.gather(ch_route_probs.view(batch_size, -1), 1, flat_channel_index)
-    route_bias = torch.log(seq_bias.clamp_min(1e-12)) + torch.log(ch_bias.clamp_min(1e-12))
+    grouped_source_index = memory_source_index.reshape(batch_size, num_sources, num_channels)
+    grouped_channel_index = memory_channel_index.reshape(batch_size, num_sources, num_channels)
+    expected_channel_index = torch.arange(num_channels, device=device, dtype=torch.long).view(1, 1, num_channels)
+    if not torch.equal(grouped_channel_index, expected_channel_index.expand_as(grouped_channel_index)):
+        raise ValueError("Expected memory_channel_index to group channels contiguously per source sequence")
+    if not torch.equal(grouped_source_index, grouped_source_index[:, :, :1].expand_as(grouped_source_index)):
+        raise ValueError("Expected memory_source_index to remain constant within each source group")
 
-    logits = content_logits + route_bias[:, None, None, :].to(dtype)
-    attn_probs = nn.functional.softmax(logits, dim=-1, dtype=torch.float32).to(dtype)
-    attn_probs = nn.functional.dropout(attn_probs, p=attention_dropout, training=training)
-    route_output = torch.matmul(attn_probs, gathered_values)
+    gathered_keys = gathered_keys.reshape(batch_size, num_heads, num_sources, num_channels, head_dim)
+    gathered_values = gathered_values.reshape(batch_size, num_heads, num_sources, num_channels, head_dim)
+    source_ids = grouped_source_index[:, :, 0]
+
+    content_logits = torch.einsum("bhld,bhscd->bhlsc", query_states, gathered_keys) / math.sqrt(head_dim)
+    channel_attn = nn.functional.softmax(content_logits, dim=-1, dtype=torch.float32).to(dtype)
+    channel_attn = nn.functional.dropout(channel_attn, p=attention_dropout, training=training)
+
+    seq_gate = torch.gather(seq_route_probs, 1, source_ids)
+    ch_gate = torch.gather(
+        ch_route_probs.view(batch_size, -1),
+        1,
+        (grouped_source_index * num_channels + grouped_channel_index).reshape(batch_size, -1),
+    ).reshape(batch_size, num_sources, num_channels)
+    ch_gate = ch_gate * float(num_channels)
+
+    gated_channel_attn = channel_attn * ch_gate[:, None, None, :, :]
+    route_output = torch.einsum("bhlsc,bhscd->bhlsd", gated_channel_attn, gathered_values)
 
     if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
         value_norm = torch.norm(gathered_values, p=2, dim=-1, keepdim=True)
-        weighted_value_norm = torch.matmul(attn_probs, value_norm)
+        weighted_value_norm = torch.einsum("bhlsc,bhscf->bhlsf", channel_attn, value_norm)
         route_output = route_output / (weighted_value_norm + 1e-6)
+
+    route_output = (route_output * seq_gate[:, None, None, :, None]).sum(dim=3)
 
     if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
         route_output = route_output.masked_fill(kwargs["first_half_mask"][:, None, :, None].bool(), 0.0)
@@ -560,7 +587,7 @@ class LlamaAttention(nn.Module):
             )
             attn_output = attn_output + sparse_output
         else:
-            route_bias_output = _compute_chorus_route_bias_injection(
+            routed_output = _compute_chorus_routed_injection(
                 query_states=query_states,
                 cached_key_value=cached_key_value,
                 num_key_value_groups=self.num_key_value_groups,
@@ -569,8 +596,8 @@ class LlamaAttention(nn.Module):
                 training=self.training,
                 kwargs=kwargs,
             )
-            if route_bias_output is not None:
-                attn_output = attn_output + route_bias_output
+            if routed_output is not None:
+                attn_output = attn_output + routed_output
             elif inbatch_attn is not None and cached_key_value is not None:
                 # Debugging: Log shapes to diagnose rank disagreement
                 # if self.layer_idx == 0:
@@ -797,7 +824,7 @@ class LlamaFlashAttention2(LlamaAttention):
             )
             attn_output = attn_output + sparse_output.transpose(1, 2)
         else:
-            route_bias_output = _compute_chorus_route_bias_injection(
+            routed_output = _compute_chorus_routed_injection(
                 query_states=query_states,
                 cached_key_value=cached_key_value,
                 num_key_value_groups=self.num_key_value_groups,
@@ -806,8 +833,8 @@ class LlamaFlashAttention2(LlamaAttention):
                 training=self.training,
                 kwargs=kwargs,
             )
-            if route_bias_output is not None:
-                attn_output = attn_output + route_bias_output
+            if routed_output is not None:
+                attn_output = attn_output + routed_output
             elif inbatch_attn is not None and cached_key_value is not None:
                 # transpose back
                 query_states = query_states.transpose(1, 2)
@@ -1057,7 +1084,7 @@ class LlamaSdpaAttention(LlamaAttention):
             )
             attn_output = attn_output + sparse_output
         else:
-            route_bias_output = _compute_chorus_route_bias_injection(
+            routed_output = _compute_chorus_routed_injection(
                 query_states=query_states,
                 cached_key_value=cached_key_value,
                 num_key_value_groups=self.num_key_value_groups,
@@ -1066,8 +1093,8 @@ class LlamaSdpaAttention(LlamaAttention):
                 training=self.training,
                 kwargs=kwargs,
             )
-            if route_bias_output is not None:
-                attn_output = attn_output + route_bias_output
+            if routed_output is not None:
+                attn_output = attn_output + routed_output
             elif inbatch_attn is not None and cached_key_value is not None:
                 cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
                 cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
