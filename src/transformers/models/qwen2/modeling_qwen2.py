@@ -187,7 +187,7 @@ def _compute_chorus_routed_injection(
 
     seq_gate = torch.gather(seq_route_probs, 1, source_ids)
     ch_gate = torch.gather(
-        ch_route_probs.view(batch_size, -1),
+        ch_route_probs.reshape(batch_size, -1),
         1,
         (grouped_source_index * num_channels + grouped_channel_index).reshape(batch_size, -1),
     ).reshape(batch_size, num_sources, num_channels)
