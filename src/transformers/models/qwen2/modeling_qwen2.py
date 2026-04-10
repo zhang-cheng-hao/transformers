@@ -210,6 +210,13 @@ def _compute_chorus_routed_injection(
     return route_output
 
 
+def _has_chorus_routed_metadata(kwargs) -> bool:
+    return all(
+        kwargs.get(key) is not None
+        for key in ("seq_route_probs", "ch_route_probs", "memory_source_index", "memory_channel_index")
+    )
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2
 class Qwen2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -1283,12 +1290,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
+        chorus_routed = _has_chorus_routed_metadata(kwargs)
+
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             _use_inbatch = (
-                (inbatch_attn is not None or block_sparse_metadata is not None)
+                (inbatch_attn is not None or block_sparse_metadata is not None or chorus_routed)
                 and cached_key_values is not None
                 and (inbatch_attn_layers is None or layer_idx in inbatch_attn_layers)
             )

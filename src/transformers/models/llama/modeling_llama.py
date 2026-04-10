@@ -176,6 +176,13 @@ def _compute_chorus_routed_injection(
         route_output = route_output.masked_fill(kwargs["routing_query_mask"].unsqueeze(1).unsqueeze(-1).bool(), 0.0)
     return route_output
 
+
+def _has_chorus_routed_metadata(kwargs) -> bool:
+    return all(
+        kwargs.get(key) is not None
+        for key in ("seq_route_probs", "ch_route_probs", "memory_source_index", "memory_channel_index")
+    )
+
 def _prepare_4d_causal_attention_mask_with_cache_position(
     attention_mask: torch.Tensor,
     sequence_length: int,
@@ -1580,12 +1587,14 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
+        chorus_routed = _has_chorus_routed_metadata(kwargs)
+
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             _use_inbatch = (
-                (inbatch_attn is not None or block_sparse_metadata is not None)
+                (inbatch_attn is not None or block_sparse_metadata is not None or chorus_routed)
                 and cached_key_values is not None
                 and (inbatch_attn_layers is None or layer_idx in inbatch_attn_layers)
             )
