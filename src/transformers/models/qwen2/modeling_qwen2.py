@@ -1349,9 +1349,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
             _layer_inbatch_attn = inbatch_attn if _use_inbatch else None
             _layer_cached_kv = cached_key_values[layer_idx] if _use_inbatch else None
             layer_kwargs = kwargs
-            if _use_inbatch and kwargs.get("evidence_cached_key_values") is not None:
+            if kwargs.get("evidence_cached_key_values") is not None:
                 layer_kwargs = dict(kwargs)
-                layer_kwargs["evidence_cached_key_values"] = kwargs["evidence_cached_key_values"][layer_idx]
+                layer_kwargs["evidence_cached_key_values"] = (
+                    kwargs["evidence_cached_key_values"][layer_idx] if _use_inbatch else None
+                )
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
